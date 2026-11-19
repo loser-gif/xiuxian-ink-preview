@@ -1,0 +1,5445 @@
+/* 墨仙录 · 主逻辑 */
+'use strict';
+(() => {
+const $ = s => document.querySelector(s);
+const $$ = s => Array.from(document.querySelectorAll(s));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const pick = a => a[Math.floor(Math.random() * a.length)];
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const SAVE_KEY = 'moxian.v1';
+const root = document.documentElement;
+
+/* ================= 视觉初始化 ================= */
+const svgURL = svg => `url("data:image/svg+xml;utf8,${encodeURIComponent(svg)}")`;
+function brushImg(w, h, seed, fill) {
+  return svgURL(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><path d="${Ink.brushPath(w, h, seed)}" fill="${fill}"/></svg>`);
+}
+function brushBtnImg(seed, fill, alpha) {
+  // 双层笔触：浓淡相叠，像一笔扫过
+  const w = 300, h = 90;
+  const p1 = Ink.brushPath(w, h * 0.78, seed), p2 = Ink.brushPath(w * 0.96, h * 0.5, seed + 9);
+  return svgURL(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="-8 -5 ${w + 24} ${h + 10}" preserveAspectRatio="none"><g fill="${fill}"><path d="${p1}" transform="translate(0 ${h * 0.11})" opacity="${alpha}"/><path d="${p2}" transform="translate(8 ${h * 0.3}) rotate(-1.2)" opacity="${alpha * 0.5}"/></g></svg>`);
+}
+const MTN = [
+  { seed: 11, rgb: [104, 120, 130], alpha: 0.55, base: 0.98, amp: 0.82, peaks: 4, width: 0.09, sharp: 2.3, fade: 0.5, wash: 0.26, cun: 0.05, cunLen: 0.6, folds: 1, line: 0, hero: 1 },
+  { seed: 23, rgb: [74, 82, 86], alpha: 0.62, base: 1.0, amp: 0.62, peaks: 3, width: 0.12, sharp: 2.4, fade: 0.6, wash: 0.3, cun: 0.12, cunLen: 0.8, folds: 2, line: 0.6, dots: 0.03, hero: 2 },
+  { seed: 41, rgb: [44, 46, 46], alpha: 0.78, base: 1.0, amp: 0.5, peaks: 3, width: 0.15, sharp: 2.0, fade: 0.7, wash: 0.32, cun: 0.18, cunLen: 1, folds: 2, line: 1.0, dots: 0.06, trees: 2, treeSize: 0.7 },
+  { seed: 57, rgb: [26, 25, 23], alpha: 0.92, base: 1.08, amp: 0.62, peaks: 2, hero: 0, width: 0.2, sharp: 1.8, fade: 0.9, wash: 0.42, cun: 0.25, cunLen: 1.2, folds: 2, line: 1.5, dots: 0.1, trees: 3, treeSize: 1, bottomFade: false },
+];
+let lastW = 0, lastRealmDraw = -1;
+const REALM_SHIFT = [
+  [22, 34, 8],
+  [-6, 14, 32],
+  [42, 10, -16],
+  [4, 8, 28],
+  [-8, 4, 36],
+  [10, 12, 30],
+];
+/* 夜墨远山：淡墨绘在透明画布上，避免整层反相把湖面切成一条硬边 */
+const MTN_NIGHT = [
+  { rgb: [168, 160, 151], alpha: 0.4 },
+  { rgb: [198, 188, 174], alpha: 0.54 },
+  { rgb: [222, 212, 198], alpha: 0.68 },
+  { rgb: [236, 228, 216], alpha: 0.76, bottomFade: true },
+];
+let mtnGen = 0;
+function paintMountain(cv, i, night, title, realm, sh) {
+  const base = night ? Object.assign({}, MTN[i], MTN_NIGHT[i]) : MTN[i];
+  const rgb = (base.rgb || [40, 40, 40]).map((v, k) => Math.max(0, Math.min(255, v + (sh[k] || 0) * (i < 2 ? 0.65 : 1))));
+  let shape = {};
+  if (title && innerWidth < 700 && innerHeight > innerWidth) shape = { width: base.width * 1.55, sharp: base.sharp * .85 };
+  if (!title && !night && realm === 1 && i === 3) shape = { peaks: 1, amp: base.amp * 1.35, trees: 0, sharp: 2.8 };
+  else if (!title && !night && realm === 2 && i === 2) shape = { peaks: 3, amp: base.amp * 1.15, sharp: 3.1 };
+  else if (!title && !night && realm === 4 && i <= 1) shape = { peaks: 2, amp: base.amp * 0.55, trees: 0 };
+  const bamboo = !title && !night && realm === 0 && i >= 2 ? { trees: (base.trees || 0) + 3, treeSize: 1.15 } : {};
+  Ink.mountainLayer(cv, Object.assign({}, base, shape, bamboo, { rgb }));
+}
+function drawMountains(force, opt) {
+  const w = window.innerWidth;
+  const screen = document.body.dataset.screen || 'title';
+  const title = screen === 'title';
+  const realm = +(document.body.dataset.realm || 0);
+  const night = document.documentElement.dataset.theme === 'night';
+  // 卷首锁在 v35 的峰形：不随境界换色、不加竹。游玩背景仍按境界变。
+  const sig = (title ? 1000 : 0) + realm + (night ? 100 : 0);
+  lastW = w; lastRealmDraw = sig;
+  const sh = (night || title) ? [0, 0, 0] : (REALM_SHIFT[realm] || [0, 0, 0]);
+  const els = $$('.mtn');
+  const unlaid = els.some(cv => !cv.clientWidth || !cv.clientHeight);
+  if (unlaid) {
+    drawMountains._n = (drawMountains._n || 0) + 1;
+    if (drawMountains._n < 12) {
+      clearTimeout(resizeT);
+      resizeT = setTimeout(() => drawMountains(true, opt), 80);
+    }
+    return;
+  }
+  drawMountains._n = 0;
+  const stale = els.some(cv => {
+    const s = (typeof Ink !== 'undefined' && Ink.layerScale) ? Ink.layerScale(cv.clientWidth, cv.clientHeight) : 1;
+    return Math.abs(cv.width - Math.round(cv.clientWidth * s)) > 2 || Math.abs(cv.height - Math.round(cv.clientHeight * s)) > 2;
+  });
+  if (!force && !stale && Math.abs(w - lastW) < 2 && sig === lastRealmDraw) {
+    if (wallpaperOn && typeof Wallpaper !== 'undefined' && Wallpaper.needsBuild && Wallpaper.needsBuild()) Wallpaper.rebuild();
+    return;
+  }
+  const finish = () => { if (wallpaperOn && typeof Wallpaper !== 'undefined') Wallpaper.rebuild(); };
+  if (opt && opt.yield && els.length) {
+    const gen = ++mtnGen;
+    const step = i => {
+      if (gen !== mtnGen) return;
+      if (i >= els.length) { requestAnimationFrame(finish); return; }
+      paintMountain(els[i], i, night, title, realm, sh);
+      requestAnimationFrame(() => step(i + 1));
+    };
+    requestAnimationFrame(() => step(0));
+    return;
+  }
+  mtnGen++;
+  els.forEach((cv, i) => paintMountain(cv, i, night, title, realm, sh));
+  finish();
+}
+let wallpaperOn = false;
+function mountPaperField() {
+  const host = document.getElementById('paper'); if (!host || !Ink.paperField) return;
+  let cv = host.querySelector('canvas.xuan');
+  if (!cv) {
+    cv = document.createElement('canvas'); cv.className = 'xuan'; cv.setAttribute('aria-hidden', 'true');
+    host.appendChild(cv);
+  }
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const cssW = Math.max(host.clientWidth || 0, window.innerWidth || 0, 1);
+  const cssH = Math.max(host.clientHeight || 0, window.innerHeight || 0, 1);
+  const w = Math.round(cssW * dpr), h = Math.round(cssH * dpr);
+  if (cv.width === w && cv.height === h) return;
+  cv.width = w; cv.height = h;
+  try { Ink.paperField(cv); } catch (e) { console.warn(e); }
+}
+async function initVisuals() {
+  mountPaperField();
+  root.style.setProperty('--brush-img', brushBtnImg(5, '#1b1814', 0.95));
+  root.style.setProperty('--brush-img-light', brushBtnImg(12, '#1b1814', 0.14));
+  root.style.setProperty('--brush-img-paper', brushBtnImg(19, '#f3ead6', 0.95));
+  root.style.setProperty('--brush-img-zhu-l', brushBtnImg(23, '#b3302a', 0.13));
+  root.style.setProperty('--brush-img-zhu', brushBtnImg(27, '#b3302a', 0.92));
+  root.style.setProperty('--brush-img-ink-l', brushBtnImg(31, '#1b1814', 0.1));
+  root.style.setProperty('--brush-img-night', brushBtnImg(35, '#efe4cc', 0.15));
+  root.style.setProperty('--brush-line', brushImg(400, 12, 3, '#1b1814'));
+  root.style.setProperty('--brush-bar', brushImg(400, 26, 8, '#1b1814'));
+  root.style.setProperty('--brush-bar-zhu', brushImg(400, 26, 8, '#b3302a'));
+  drawMountains(true);
+  try { root.style.setProperty('--juan-mask', `url("${juanWashMask()}")`); } catch (e) { console.warn(e); }
+  const [paper, mist, b1, b2, b3, b4, stone, big, scene] = await Promise.all([
+    Ink.paperTile(512), Ink.mistSprite(),
+    Ink.inkBlot(160, 3, { core: 0.32, rough: 0.08, splatter: 6, alpha: 0.95 }),
+    Ink.inkBlot(160, 8, { core: 0.31, rough: 0.08, splatter: 5, alpha: 0.95 }),
+    Ink.inkBlot(160, 15, { core: 0.33, rough: 0.08, splatter: 7, alpha: 0.95 }),
+    Ink.inkBlot(160, 22, { core: 0.3, rough: 0.08, splatter: 4, alpha: 0.95 }),
+    Ink.inkBlot(420, 31, { core: 0.3, rough: 0.04, splatter: 14, alpha: 0.92, halo: 0.18 }),
+    Ink.inkBlot(1000, 77, { soft: true, rgb: [32, 26, 22] }),
+    Ink.scene(800, 220),
+  ]);
+  root.style.setProperty('--mtn-img', `url(${scene})`);
+  root.style.setProperty('--paper-img', `url(${paper})`);
+  root.style.setProperty('--mist-img', `url(${mist})`);
+  root.style.setProperty('--blot', `url(${b1})`); root.style.setProperty('--blot2', `url(${b2})`);
+  root.style.setProperty('--blot3', `url(${b3})`); root.style.setProperty('--blot4', `url(${b4})`);
+  root.style.setProperty('--blot-stone', `url(${stone})`); root.style.setProperty('--blot-big', `url(${big})`);
+  try { const warm = new Image(); warm.src = big; if (warm.decode) warm.decode().catch(() => {}); } catch (e) {}
+  try { Wallpaper.init(); wallpaperOn = true; } catch (e) { console.warn(e); }
+  root.style.setProperty('--grain-img', `url(${grainTile()})`);
+  root.style.setProperty('--fiber-img', `url(${fiberTile()})`);
+  try { InkGL.init(); InkGL.setPaper(paper); } catch (e) { console.warn(e); }
+}
+function grainTile() {
+  const s = 180, cv = document.createElement('canvas'); cv.width = cv.height = s; const c = cv.getContext('2d');
+  const img = c.createImageData(s, s), d = img.data;
+  for (let i = 0; i < d.length; i += 4) { const v = Math.random(); const dark = v < .5; d[i] = d[i + 1] = d[i + 2] = dark ? 20 : 255; d[i + 3] = Math.pow(Math.random(), 3) * 120; }
+  c.putImageData(img, 0, 0); return cv.toDataURL();
+}
+/* 宣纸纤维：极淡横丝，静帧贴图（不动画，保 60fps） */
+function fiberTile() {
+  const s = 256, cv = document.createElement('canvas'); cv.width = cv.height = s; const c = cv.getContext('2d');
+  c.clearRect(0, 0, s, s);
+  for (let i = 0; i < 90; i++) {
+    const y = Math.random() * s, x0 = Math.random() * s;
+    const len = 20 + Math.random() * 70, w = 0.4 + Math.random() * 0.9;
+    c.strokeStyle = `rgba(40,32,24,${0.04 + Math.random() * 0.07})`;
+    c.lineWidth = w; c.beginPath();
+    c.moveTo(x0, y);
+    c.quadraticCurveTo(x0 + len * 0.4, y + (Math.random() - 0.5) * 3, x0 + len, y + (Math.random() - 0.5) * 2);
+    c.stroke();
+  }
+  return cv.toDataURL();
+}
+let resizeT;
+function fitSheetCap() {
+  let z = 1;
+  try { z = parseFloat(getComputedStyle(document.documentElement).zoom) || 1; } catch (e) {}
+  if (!(z > 0)) z = 1;
+  root.style.setProperty('--sheet-cap', Math.max(240, Math.floor(window.innerHeight / z - 24)) + 'px');
+}
+fitSheetCap();
+window.addEventListener('resize', () => {
+  fitSheetCap();
+  clearTimeout(resizeT);
+  resizeT = setTimeout(() => {
+    drawMountains(false);
+    mountPaperField();
+    if (wallpaperOn && typeof Wallpaper !== 'undefined' && Wallpaper.rebuild) Wallpaper.rebuild();
+  }, 250);
+});
+
+/* 触感：墨晕涟漪 */
+document.addEventListener('pointerdown', e => {
+  if (typeof FX !== 'undefined' && FX.bloomAt) FX.bloomAt(e.clientX, e.clientY);
+  const t = e.target.closest('button'); if (!t || t.disabled) return;
+  const r = document.createElement('div'); r.className = 'ripple';
+  r.style.left = e.clientX + 'px'; r.style.top = e.clientY + 'px';
+  const done = () => { if (r.parentNode) r.remove(); };
+  r.addEventListener('animationend', done);
+  document.body.appendChild(r); setTimeout(done, 950);
+}, { passive: true });
+// 阻止 iOS 捏合缩放（双击缩放已由 touch-action: manipulation 处理）
+document.addEventListener('gesturestart', e => e.preventDefault());
+
+/* ================= 墨晕文字 ================= */
+const PUNCT = '，。、；：？！”’）》」…—·';
+let inkBusyUntil = 0;
+function splitUnits(text) {
+  const units = [];
+  let glue = false;
+  for (const ch of text) {
+    if (ch === '\u2060') {
+      if (units.length) units[units.length - 1] += ch;
+      else units.push(ch);
+      glue = true;
+      continue;
+    }
+    if (glue && units.length) {
+      units[units.length - 1] += ch;
+      glue = false;
+      continue;
+    }
+    if (units.length && (PUNCT.includes(ch) || ch === ' ')) units[units.length - 1] += ch;
+    else if (units.length && '“‘（《「'.includes(units[units.length - 1].slice(-1))) units[units.length - 1] += ch;
+    else units.push(ch);
+  }
+  return units;
+}
+function splitSentences(text) {
+  const sentences = [];
+  const chars = [...text];
+  let buf = '';
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
+    buf += ch;
+    if ('。！？'.includes(ch)) {
+      while (i + 1 < chars.length && '”’》」'.includes(chars[i + 1])) { i++; buf += chars[i]; }
+      sentences.push(buf); buf = '';
+    }
+  }
+  if (buf) sentences.push(buf);
+  return sentences.length ? sentences : [''];
+}
+function bareLen(s) { return s.replace(/[\s，。、；：？！“”‘’（《》「」…—·]/g, '').length; }
+function voice(t) {
+  if (!t || !S || typeof Folio === 'undefined' || !Folio.dress) return t;
+  return Folio.dress(S, t);
+}
+function inkWrite(el, text, opt = {}) {
+  const now = performance.now();
+  const backlog = Math.max(0, inkBusyUntil - now);
+  const start = opt.immediate ? 0 : Math.min(backlog, 1400);
+  const step = opt.step || (backlog > 1200 ? 9 : 22);
+  const cadence = !!opt.cadence;
+  const quiet = cadence && typeof FX !== 'undefined' && FX.reduced && FX.reduced();
+  if (cadence) el.classList.add('ink-cadence');
+  else el.classList.remove('ink-cadence');
+  const frag = document.createDocumentFragment();
+  const sentences = splitSentences(text);
+  const lastSent = sentences.length - 1;
+  const pauseScale = text.length > 140 ? 0.62 : 1;
+  let delay = start;
+  let count = 0;
+  const closeInk = !!opt.closeInk;
+  let closeKey = lastSent;
+  if (closeInk) {
+    while (closeKey > 0 && bareLen(sentences[closeKey]) < 2) closeKey--;
+  }
+  sentences.forEach((sentence, si) => {
+    const units = splitUnits(sentence);
+    const bare = bareLen(sentence);
+    // 普通正文一句一色。起笔不再单字发枯，标点跟本句走。
+    // 收句浓墨只在显式要求时加在最后一句；很短的独句、带叹号的短句仍算强调。
+    const dense = sentences.length === 1
+      ? bare > 0 && bare <= 16
+      : ((closeInk && si === closeKey) || (/！/.test(sentence) && bare >= 2 && bare <= 20));
+    units.forEach(u => {
+      const sp = document.createElement('span');
+      sp.className = 'ink-ch';
+      if (cadence && dense) sp.classList.add('ink-dense');
+      sp.textContent = u;
+      const jitter = cadence && !quiet ? ((u.charCodeAt(0) * 17) % 11) : 0;
+      sp.style.animationDelay = (quiet ? 0 : delay) + 'ms';
+      frag.appendChild(sp);
+      count++;
+      if (!quiet) {
+        delay += step + jitter;
+        if (cadence) {
+          if (/[。！？…][”’》」]*$/.test(u)) delay += Math.round(step * 13 * pauseScale);
+          else if (/[，、；：][”’》」]*$/.test(u)) delay += Math.round(step * 4.5 * pauseScale);
+        }
+      }
+    });
+  });
+  el.textContent = ''; el.appendChild(frag);
+  const written = quiet ? 0 : delay;
+  inkBusyUntil = now + written + 200;
+  if (!cadence) {
+    const total = start + count * step + 1100;
+    setTimeout(() => { if (el.isConnected && el.querySelector('.ink-ch')) el.textContent = text; }, total + 50);
+  }
+  return written;
+}
+
+/* ================= 状态 ================= */
+let S = null;
+const sync = (s = S) => Core.sync(s);
+const R = () => REALMS[S.realm];
+const req = (s = S) => Core.req(s);
+const unit = (s = S) => Core.unit(s);
+const isLast = (s = S) => Core.isLast(s);
+const bottleneck = (s = S) => Core.bottleneck(s);
+const realmStr = (s = S) => Core.realmStr(s);
+const timeLabel = (s = S) => Core.timeLabel(s);
+const fmtNum = Core.fmtNum;
+const K = Core.K;
+const LEGACY_KEY = 'moxian.legacy';
+// 收集规则层的旁白，待主条目落笔后再依次写出
+const buffer = () => { const B = []; return { emit: e => B.push(e), flush: () => { B.forEach(pushLog); B.length = 0; } }; };
+
+let playTick = 0;
+function tickPlayed() {
+  if (!S || S.dead || S.ascended) { playTick = Date.now(); return; }
+  const now = Date.now();
+  if (playTick && document.visibilityState !== 'hidden') {
+    const d = Math.min(120000, Math.max(0, now - playTick));
+    S.played = (S.played | 0) + d;
+  }
+  playTick = now;
+}
+function save() {
+  if (!S) return;
+  tickPlayed();
+  if (typeof Slots !== 'undefined') return !!Slots.writeActive(S);
+  try {
+    const encoded = JSON.stringify(S);
+    localStorage.setItem(SAVE_KEY, encoded);
+    return localStorage.getItem(SAVE_KEY) === encoded;
+  } catch (e) { return false; }
+}
+function load() {
+  try {
+    if (typeof Slots !== 'undefined') return Slots.readActive();
+    return Core.migrate(JSON.parse(localStorage.getItem(SAVE_KEY)));
+  } catch (e) { console.warn(e); }
+  return null;
+}
+function aliveSave() {
+  if (typeof Slots === 'undefined') return load();
+  const i = Slots.aliveIndex();
+  if (i < 0) return null;
+  Slots.setActive(i);
+  return Slots.read(i);
+}
+
+/* ================= 屏幕切换（卷轴） ================= */
+let curScreen = 'title';
+/* 卷首小景的边：中心留实。底边几道宽窄不一的墨舌，左右与顶也起伏，羽化进纸，不是直线矩形渐变。 */
+function juanWashMask() {
+  const W = 880, H = 300, R = Ink.mulberry(47);
+  const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+  const c = cv.getContext('2d');
+  const lobe = (n, amp, w0) => {
+    const out = [];
+    for (let i = 0; i < n; i++) out.push({ p: 0.08 + R() * 0.84, amp: (R() * 2 - 1) * amp, w: w0 + R() * w0 });
+    return out;
+  };
+  const botL = lobe(6, 0.18, 0.042);
+  const topL = lobe(4, 0.07, 0.08);
+  const leftL = lobe(4, 0.055, 0.12);
+  const rightL = lobe(4, 0.055, 0.12);
+  const bell = (p, c0, w) => { const d = (p - c0) / w; return Math.exp(-d * d); };
+  const img = c.createImageData(W, H), data = img.data;
+  for (let y = 0; y < H; y++) {
+    const ny = y / (H - 1);
+    for (let x = 0; x < W; x++) {
+      const nx = x / (W - 1);
+      let bot = 0.80, top = 0.045, left = 0.04, right = 0.96;
+      for (const L of botL) bot += L.amp * bell(nx, L.p, L.w);
+      for (const L of topL) top += L.amp * bell(nx, L.p, L.w);
+      for (const L of leftL) left += L.amp * bell(ny, L.p, L.w);
+      for (const L of rightL) right -= L.amp * bell(ny, L.p, L.w);
+      if (bot > 0.96) bot = 0.96; else if (bot < 0.58) bot = 0.58;
+      if (top < 0) top = 0; else if (top > 0.16) top = 0.16;
+      if (left < 0) left = 0; else if (left > 0.14) left = 0.14;
+      if (right > 1) right = 1; else if (right < 0.86) right = 0.86;
+      const yIn = ny < 0.46 ? (ny - top) / 0.07 : (bot - ny) / 0.075;
+      const xIn = nx < 0.5 ? (nx - left) / 0.05 : (right - nx) / 0.05;
+      let a = yIn < xIn ? yIn : xIn;
+      if (a < 0) a = 0; else if (a > 1) a = 1;
+      a = a * a * (3 - 2 * a);
+      const i = (y * W + x) * 4;
+      data[i] = data[i + 1] = data[i + 2] = 255;
+      data[i + 3] = (a * 255 + 0.5) | 0;
+    }
+  }
+  c.putImageData(img, 0, 0);
+  return cv.toDataURL('image/png');
+}
+function placeRealmScape() {
+  const svg = document.getElementById('realm-scape');
+  if (!svg) return;
+  const screen = document.body.dataset.screen;
+  if (screen === 'main') {
+    const head = document.getElementById('juan-head');
+    if (head && svg.parentElement !== head) head.insertBefore(svg, head.firstChild);
+  } else {
+    const sc = document.getElementById('scenery');
+    const veil = document.getElementById('season-veil');
+    if (sc && svg.parentElement !== sc) sc.insertBefore(svg, veil || null);
+  }
+}
+function setScreen(id, keep) {
+  const prev = curScreen;
+  if (curScreen === 'title' && id !== 'title') document.body.classList.add('intro-done');
+  $$('.screen').forEach(el => el.hidden = el.id !== 'scr-' + id && el !== keep);
+  document.body.dataset.screen = id; curScreen = id;
+  if (id === 'main' && prev !== 'main') setPlayPage('log');
+  placeRealmScape();
+  if (prev !== id && (prev === 'title' || id === 'title')) drawMountains(true, { yield: !snappy() });
+  if (typeof MoAudio !== 'undefined') {
+    const mode = id === 'title' ? 'title' : (id === 'main' || id === 'create' ? 'main' : 'off');
+    MoAudio.startAmbient(mode);
+    if (id === 'main' && S) MoAudio.setPlace(S.loc, Math.floor((S.months % 12) / 3));
+  }
+}
+let lastTap = null;
+document.addEventListener('pointerdown', e => { lastTap = [e.clientX, e.clientY]; }, { passive: true, capture: true });
+// Lift only the departing paper; the incoming UI and landscape stay at rest.
+async function paperPassage(id, ready) {
+  const previous = $('#scr-' + curScreen), next = $('#scr-' + id);
+  const mode = id === 'create' ? 'open' : curScreen === 'title' ? 'resume' : 'name';
+  const canFade = !document.hidden && typeof previous.animate === 'function';
+  const full = !splashSoft() && canFade;
+  const peelMs = full ? 760 : 240;
+  const animations = [], keys = new Set();
+  let switched = false, stopped = false, active = true, release;
+  const interrupted = new Promise(resolve => { release = resolve; });
+  const stop = () => { stopped = true; release(); };
+  const wait = ms => stopped ? Promise.resolve() : Promise.race([sleep(ms), interrupted]);
+  const reduced = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)');
+  const visibility = () => { if (document.hidden) { keys.clear(); stop(); } };
+  const motion = () => { if (splashSoft()) stop(); };
+  const keydown = e => {
+    if (!active && !keys.has(e.code)) return;
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (active) keys.add(e.code);
+    e.preventDefault(); e.stopImmediatePropagation();
+    if (e.key === 'Escape') stop();
+  };
+  const unbindKeys = () => { window.removeEventListener('keydown', keydown, true); window.removeEventListener('keyup', keyup, true); window.removeEventListener('blur', blur); };
+  const keyup = e => { keys.delete(e.code); if (!active && !keys.size) unbindKeys(); };
+  const blur = () => { keys.clear(); if (!active) unbindKeys(); else stop(); };
+  const animate = (el, frames, duration, delay = 0) => {
+    if (!el || stopped || !canFade) return;
+    const animation = el.animate(frames, { duration, delay, easing: 'cubic-bezier(.22,.61,.36,1)', fill: 'both' });
+    animations.push(animation);
+    return animation;
+  };
+  const switchPage = () => {
+    if (switched) return;
+    // Render the incoming paper at rest beneath the departing opaque sheet.
+    next.style.opacity = '1';
+    previous.classList.add('paper-leave');
+    previous.style.opacity = '1';
+    switched = true; setScreen(id, previous);
+    if (ready) ready();
+    scenery.style.cssText = sceneryStyle;
+    sceneryTarget = readSceneryTarget();
+    scenery.style.opacity = String(sceneryTarget);
+  };
+  const guard = document.createElement('div'); guard.className = 'paper-guard'; guard.setAttribute('aria-hidden', 'true');
+  const focusWasInside = previous.contains(document.activeElement);
+  const previousOpacity = previous.style.opacity;
+  const nextOpacity = next.style.opacity;
+  const scenery = $('#scenery'), sceneryStyle = scenery.style.cssText;
+  let sceneryTarget = null;
+  const readSceneryTarget = () => {
+    const inlineOpacity = scenery.style.opacity;
+    scenery.style.removeProperty('opacity');
+    const opacity = parseFloat(getComputedStyle(scenery).opacity);
+    scenery.style.opacity = inlineOpacity;
+    return Number.isFinite(opacity) ? opacity : 0;
+  };
+  const lookWatch = new MutationObserver(motion);
+  document.body.appendChild(guard);
+  window.addEventListener('keydown', keydown, true); window.addEventListener('keyup', keyup, true); window.addEventListener('blur', blur);
+  window.addEventListener('resize', stop); document.addEventListener('visibilitychange', visibility);
+  if (reduced) reduced.addListener(motion);
+  lookWatch.observe(document.documentElement, { attributes: true, attributeFilter: ['data-motion', 'data-fx'] });
+  $('#app').setAttribute('aria-busy', 'true');
+  try {
+    document.body.classList.add('paper-turning'); document.body.dataset.passage = mode;
+    switchPage();
+    // Only the old sheet moves. The new UI and landscape are already at rest.
+    previous.style.setProperty('--peel-ms', peelMs + 'ms');
+    previous.classList.add('paper-peel');
+    if (!stopped && canFade) {
+      animate(previous, [
+        { transform: 'perspective(1400px) rotate(0deg) rotateY(0deg) scaleX(1)', clipPath: 'polygon(0% 0%,100% 0%,100% 100%,0% 100%,0% 100%)', opacity: 1 },
+        { transform: 'perspective(1400px) rotate(-2deg) rotateY(-18deg) scaleX(.98)', clipPath: 'polygon(0% 0%,100% 0%,100% 100%,45% 100%,0% 55%)', opacity: 1, offset: .3 },
+        { transform: 'perspective(1400px) rotate(-4deg) rotateY(-38deg) scaleX(.95)', clipPath: 'polygon(52% 0%,100% 0%,100% 48%,100% 48%,52% 0%)', opacity: .94, offset: .7 },
+        { transform: 'perspective(1400px) rotate(-5deg) rotateY(-55deg) scaleX(.92)', clipPath: 'polygon(100% 0%,100% 0%,100% 0%,100% 0%,100% 0%)', opacity: 0 }
+      ], peelMs);
+    } else if (!stopped) {
+      previous.classList.add('paper-peel-css');
+    }
+    await wait(peelMs);
+  } finally {
+    switchPage();
+    // Hide the old sheet before removing its animation fill on WebKit.
+    previous.style.opacity = '0';
+    // Commit the incoming paper before removing WAAPI fill (WebKit).
+    next.style.opacity = '1';
+    // The landscape never animates; keep the CSS target pinned through cleanup.
+    if (sceneryTarget === null) sceneryTarget = readSceneryTarget();
+    scenery.style.opacity = String(sceneryTarget);
+    animations.forEach(a => a.cancel());
+    previous.classList.remove('paper-leave', 'paper-peel', 'paper-peel-css');
+    previous.style.removeProperty('--peel-ms');
+    previous.hidden = true;
+    previous.style.opacity = previousOpacity;
+    next.style.opacity = nextOpacity;
+    guard.remove();
+    scenery.style.cssText = sceneryStyle;
+    document.body.classList.remove('paper-turning'); delete document.body.dataset.passage;
+    $('#app').removeAttribute('aria-busy'); active = false;
+    window.removeEventListener('resize', stop); document.removeEventListener('visibilitychange', visibility);
+    if (reduced) reduced.removeListener(motion); lookWatch.disconnect();
+    if (!keys.size) unbindKeys();
+    if (focusWasInside) {
+      const heading = next.querySelector(id === 'create' ? '.ch-title' : '#journal-title');
+      if (heading) { heading.setAttribute('tabindex', '-1'); heading.focus({ preventScroll: true }); }
+    }
+  }
+}
+async function unrollTo(id, ready) {
+  const t = lastTap; lastTap = null;
+  if (typeof MoAudio !== 'undefined') { MoAudio.unlock(); MoAudio.play('paper'); }
+  if ((curScreen === 'title' || curScreen === 'create') && (id === 'create' || id === 'main')) {
+    if (unrollTo.turn) return unrollTo.turn;
+    unrollTo.turn = paperPassage(id, ready).finally(() => { unrollTo.turn = null; });
+    return unrollTo.turn;
+  }
+  await FX.wash(async () => { setScreen(id); if (ready) ready(); await sleep(60); }, t && t[0], t && t[1]);
+}
+
+function toast(msg) {
+  const t = $('#toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove('show'), 1900);
+}
+
+/* ================= 卷首 ================= */
+/* 公告。已读版本只写 moxian.notice，不动存档。 */
+const NOTICE_KEY = 'moxian.notice';
+function noticeLatest() {
+  if (typeof NOTICES === 'undefined' || !NOTICES.length) return '';
+  return String(NOTICES[0].v);
+}
+function noticeUnread() {
+  const v = noticeLatest();
+  if (!v) return false;
+  let seen = '';
+  try { seen = localStorage.getItem(NOTICE_KEY) || ''; } catch (e) {}
+  return seen !== v;
+}
+function paintNoticeDot() {
+  const btn = $('#btn-notice');
+  if (!btn) return;
+  if (!noticeLatest()) { btn.hidden = true; return; }
+  btn.hidden = false;
+  btn.classList.toggle('has-news', noticeUnread());
+}
+function noticeDate(iso) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || '');
+  if (!m || typeof cn !== 'function') return iso || '';
+  return cn(+m[1]) + '年' + cn(+m[2]) + '月' + cn(+m[3]) + '日';
+}
+function openNotice() {
+  if (!noticeLatest()) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'notice-list';
+  NOTICES.forEach(n => {
+    const card = document.createElement('article');
+    card.className = 'notice-card';
+    const head = document.createElement('header');
+    const ver = document.createElement('b');
+    ver.textContent = n.name ? n.name : (n.to ? ('v' + n.v + ' · 至 v' + n.to) : ('v' + n.v));
+    const time = document.createElement('time');
+    time.dateTime = n.date || '';
+    time.textContent = noticeDate(n.date);
+    const ul = document.createElement('ul');
+    (n.items || []).forEach(t => {
+      const li = document.createElement('li');
+      li.textContent = t;
+      ul.appendChild(li);
+    });
+    head.appendChild(ver);
+    head.appendChild(time);
+    card.appendChild(head);
+    card.appendChild(ul);
+    wrap.appendChild(card);
+  });
+  try { localStorage.setItem(NOTICE_KEY, noticeLatest()); } catch (e) {}
+  paintNoticeDot();
+  openSheet('公告', wrap);
+}
+
+function initTitle() {
+  const s = aliveSave();
+  if (s && !s.dead && !s.ascended) {
+    $('#btn-continue').hidden = false;
+    const extra = (typeof Slots !== 'undefined') ? Slots.loadBox().slots.filter(x => x && x.sum && !x.sum.dead && !x.sum.ascended).length : 1;
+    $('#continue-sub').textContent = extra > 1 ? `${s.name} · ${realmStr(s)} · 另有卷` : `${s.name} · ${realmStr(s)}`;
+  } else {
+    const bc = $('#btn-continue'); if (bc) bc.hidden = true;
+  }
+  const _sea = s && !s.dead && !s.ascended ? Math.floor((s.months % 12) / 3) : 0;
+  FX.setSeason(_sea); FX.setGold(0);
+  document.body.dataset.season = _sea;
+  document.body.dataset.tod = 'dawn';
+  document.body.dataset.realm = (s && !s.dead && !s.ascended) ? String(s.realm || 0) : '0';
+  shownRealm = document.body.dataset.realm;
+  drawMountains(true);
+  const subAtlas = $('#atlas-sub');
+  if (subAtlas && typeof Samsara !== 'undefined') {
+    const st = Samsara.atlasStats();
+    subAtlas.textContent = '仙途志';
+  }
+  paintLunhuiSeal();
+  const legPeek = (typeof Samsara !== 'undefined' && Samsara.peekLegacy) ? Samsara.peekLegacy() : null;
+  const bridgeOn = typeof Samsara !== 'undefined' && Samsara.bridgeOpen && Samsara.bridgeOpen();
+  const legHint = $('#legacy-hint');
+  if (legHint) {
+    if (bridgeOn) {
+      legHint.hidden = false;
+      legHint.textContent = '奈何桥上，还有一件事没选';
+    } else if (legPeek && legPeek.naihe) {
+      const lab = { mem: '一缕记忆', page: '一卷残篇', bond: '一段因果', none: '空手过桥' }[legPeek.kind] || '已择';
+      legHint.hidden = false;
+      legHint.textContent = '前世已择 · ' + lab;
+    } else if (legPeek) {
+      const bits = [];
+      if (legPeek.wx) bits.push('悟性残念');
+      if (legPeek.canhun) bits.push('法宝残魂');
+      if (legPeek.daoji) bits.push('道基残忆');
+      if (legPeek.auxPage) bits.push('功法残页');
+      if (legPeek.sectMark) bits.push('门派印记');
+      if (legPeek.courtMark) bits.push('皇命印记');
+      if (legPeek.cave) bits.push('旧洞残钥');
+      legHint.hidden = false;
+      legHint.textContent = '前世余韵待启 · ' + (bits.join(' · ') || '一缕残念');
+    } else legHint.hidden = true;
+  }
+  const btnDaily = $('#btn-daily');
+  if (btnDaily && typeof Samsara !== 'undefined') {
+    const ds = Samsara.dailyStatus();
+    btnDaily.hidden = false;
+    const sm = btnDaily.querySelector('small');
+    if (sm) sm.textContent = ds.claimed ? '今日已领' : '此卷晨露';
+    btnDaily.classList.toggle('dim', !!ds.claimed);
+    btnDaily.onclick = () => {
+      FX.requestTilt();
+      if (!s || s.dead || s.ascended) { toast('须先有一卷在修，方可领日缘'); return; }
+      S = s;
+      const r = Samsara.claimDaily(S, pushLog);
+      if (r.err) { toast(r.err); return; }
+      save(); toast('日缘已领');
+      initTitle();
+    };
+  }
+  $('#btn-new').onclick = () => {
+    if (window.__resumeCreated) return window.__resumeCreated();
+    if (newLifeLock) return;
+    newLifeLock = true;
+    FX.requestTilt();
+    window.__trialStart = false;
+    const go = async () => {
+      try {
+        if (!(await pickSlotForNew(false, true))) return;
+        const meta = typeof Samsara !== 'undefined' ? Samsara.loadMeta(true) : JSON.parse(Slots.readEffect('moxian.meta') || '{}');
+        if (typeof Samsara !== 'undefined' && Samsara.peekLegacy) Samsara.peekLegacy(true);
+        else JSON.parse(Slots.readEffect('moxian.legacy') || 'null');
+        if (meta.bridge && meta.bridge.open) throw Error('pending bridge choice');
+        await unrollTo('childhood');
+        const played = await ChildhoodUI.begin();
+        if (played && played.ok) {
+          applyOpeningSex(played.sex === 'f' ? 'female' : 'male');
+          await newGame(played.name, played.root, { id: 'free' }, 'village', { mortal: true });
+        } else { window.__slotTarget = null; clearOpeningSex(); initTitle(); unrollTo('title'); }
+
+      } catch (err) {
+        window.__slotTarget = null;
+        clearOpeningSex();
+        toast('开卷未成，请稍后重试');
+        if (typeof console !== 'undefined') console.error(err);
+      } finally {
+        newLifeLock = false;
+      }
+    };
+    try {
+      const bridge = typeof Samsara !== 'undefined' ? Samsara.bridgeOpen(true) : (JSON.parse(Slots.readEffect('moxian.meta') || '{}').bridge || {}).open;
+      if (bridge) { openNaihe(go, () => { newLifeLock = false; }); return; }
+    } catch (e) {
+      newLifeLock = false;
+      toast('开卷未成，请稍后重试');
+      return;
+    }
+    go();
+  };
+  const btnTrial = $('#btn-trial');
+  if (btnTrial) {
+    btnTrial.hidden = false;
+    btnTrial.onclick = async () => {
+      FX.requestTilt();
+      const ok = await trialBrief();
+      if (!ok) return;
+      if (!(await pickSlotForNew(true))) return;
+      window.__trialStart = true;
+      clearOpeningSex();
+      resetCreate(); unrollTo('create');
+    };
+  }
+  const btnAtlas = $('#btn-atlas');
+  if (btnAtlas) btnAtlas.onclick = () => { FX.requestTilt(); openAtlasSheet(); };
+  const btnSlots = $('#btn-slots');
+  if (btnSlots) btnSlots.onclick = () => { FX.requestTilt(); openSlots(); };
+  $('#btn-continue').onclick = () => { FX.requestTilt(); S = aliveSave(); if (!S) return; playTick = Date.now(); enterMain(true); };
+  const btnNotice = $('#btn-notice');
+  if (btnNotice) {
+    paintNoticeDot();
+    btnNotice.onclick = () => { FX.requestTilt(); openNotice(); };
+  }
+}
+
+async function pickSlotForNew(trial, deferActivate) {
+  if (typeof Slots === 'undefined') return true;
+  let i = Slots.firstEmpty();
+  if (i < 0) { toast(`${cn(Slots.N)}卷皆满，请先在存档中自行整理空卷。`); return false; }
+  window.__slotTarget = i;
+  return true;
+}
+
+/* 一念上山。只拦在新开一卷之前；续卷与试炼不经过。不写存档，不抬 SAVE_V。 */
+let xiantuGen = 0;
+let xiantuCurrent = null;
+let newLifeLock = false;
+window.__xiantuStats = { arrivals: 0, dismisses: 0, fails: 0, ignored: 0 };
+const XIANTU_URL = 'opening/xiantu.html?v=169';
+
+function xiantuValid(result) {
+  if (!result || result.type !== 'xiantu-opening:complete' || result.version !== 1) return false;
+  if (result.gender !== 'male' && result.gender !== 'female') return false;
+  if (result.status !== 'completed' && result.status !== 'skipped') return false;
+  const id = result.runId;
+  return typeof id === 'number' && id >= 1 && id === (id | 0);
+}
+function applyOpeningSex(gender) {
+  const sex = gender === 'female' ? 'f' : 'm';
+  window.__openingSex = sex;
+  window.__who = window.__who || { sex: 'm', mate: 'any' };
+  if (window.__who.mate !== 'm' && window.__who.mate !== 'f' && window.__who.mate !== 'any') window.__who.mate = 'any';
+  window.__who.sex = sex;
+}
+function clearOpeningSex() { window.__openingSex = null; window.__villageDraft = null; }
+function paintWhoPick() {
+  const pick = document.getElementById('who-pick');
+  if (!pick) return;
+  const locked = window.__openingSex === 'm' || window.__openingSex === 'f';
+  pick.classList.toggle('sex-locked', locked);
+  const fixed = pick.querySelector('.who-fixed');
+  if (fixed) {
+    fixed.hidden = !locked;
+    fixed.textContent = window.__openingSex === 'f' ? '女' : '男';
+  }
+  const who = window.__who || { sex: 'm', mate: 'any' };
+  pick.querySelectorAll('[data-k]').forEach(b => {
+    b.classList.toggle('on', who[b.dataset.k] === b.dataset.v);
+  });
+}
+function focusCreate() {
+  const name = document.getElementById('inp-name');
+  if (name) name.focus({ preventScroll: true });
+}
+function revealCreate() {
+  resetCreate();
+  setScreen('create');
+  const host = document.getElementById('xiantu-host');
+  let gone = false;
+  const done = () => {
+    if (gone) return;
+    gone = true;
+    document.body.classList.remove('xiantu-open');
+    if (host && host.parentNode) host.remove();
+    focusCreate();
+  };
+  const reduced = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (!host || reduced) { done(); return; }
+  host.classList.add('is-leaving');
+  host.addEventListener('transitionend', done);
+  setTimeout(done, 520);
+}
+function playXiantuOpening() {
+  if (xiantuCurrent) return xiantuCurrent;
+  const gen = ++xiantuGen;
+  const seen = {};
+  let settled = false;
+  let host = null;
+  let frame = null;
+  let timer = 0;
+  let onPageShow = null;
+  let onKey = null;
+  const dropHandlers = child => {
+    if (!child) return;
+    try { child.onXiantuOpeningComplete = null; } catch (e) {}
+    try { child.onXiantuOpeningDismiss = null; } catch (e2) {}
+  };
+  const destroyChild = () => {
+    const child = frame && frame.contentWindow;
+    dropHandlers(child);
+    try { if (child && child.xiantuOpening && child.xiantuOpening.destroy) child.xiantuOpening.destroy(); } catch (e) {}
+  };
+  const detach = () => {
+    if (timer) { clearTimeout(timer); timer = 0; }
+    if (onPageShow) { window.removeEventListener('pageshow', onPageShow); onPageShow = null; }
+    if (onKey) { window.removeEventListener('keydown', onKey, true); onKey = null; }
+  };
+  const removeHost = () => {
+    detach();
+    document.body.classList.remove('xiantu-open');
+    if (host && host.parentNode) host.remove();
+    host = null;
+    frame = null;
+  };
+  const promise = new Promise(resolve => {
+    const settle = (kind, result) => {
+      if (settled || gen !== xiantuGen) {
+        window.__xiantuStats.ignored++;
+        return;
+      }
+      settled = true;
+      let snap = null;
+      try { snap = frame && frame.contentWindow && frame.contentWindow.demoDebug; } catch (e) {}
+      try {
+        const end = frame && frame.contentDocument && frame.contentDocument.getElementById('end');
+        if (end) end.classList.add('hidden');
+      } catch (e2) {}
+      destroyChild();
+      detach();
+      window.__xiantuLast = {
+        kind: kind,
+        gender: result && result.gender ? result.gender : '',
+        status: result && result.status ? result.status : '',
+        runId: result && result.runId ? result.runId : 0,
+        audioState: snap && snap.audioState ? snap.audioState : '',
+        sources: snap && typeof snap.activeSources === 'number' ? snap.activeSources : 0
+      };
+      if (kind === 'done') {
+        window.__xiantuStats.arrivals++;
+        resolve({ ok: true, gender: result.gender, status: result.status, runId: result.runId });
+        return;
+      }
+      if (kind === 'dismiss') window.__xiantuStats.dismisses++;
+      else window.__xiantuStats.fails++;
+      removeHost();
+      if (curScreen === 'title' && typeof MoAudio !== 'undefined' && MoAudio.startAmbient) MoAudio.startAmbient('title');
+      resolve({ ok: false, reason: kind });
+    };
+    host = document.createElement('div');
+    host.id = 'xiantu-host';
+    host.className = 'xiantu-host';
+    frame = document.createElement('iframe');
+    frame.className = 'xiantu-frame';
+    frame.title = '纸上仙途 · 一念上山';
+    frame.setAttribute('aria-label', '一念上山');
+    host.appendChild(frame);
+    document.body.appendChild(host);
+    document.body.classList.add('xiantu-open');
+    if (typeof MoAudio !== 'undefined' && MoAudio.startAmbient) MoAudio.startAmbient('off');
+    const arm = () => {
+      if (settled || gen !== xiantuGen) return;
+      const child = frame.contentWindow;
+      if (!child || !child.xiantuOpening) { settle('fail', null); return; }
+      child.onXiantuOpeningComplete = result => {
+        if (settled || gen !== xiantuGen) { window.__xiantuStats.ignored++; return; }
+        if (!xiantuValid(result) || seen[result.runId]) { window.__xiantuStats.ignored++; return; }
+        seen[result.runId] = 1;
+        settle('done', result);
+      };
+      child.onXiantuOpeningDismiss = () => {
+        if (settled || gen !== xiantuGen) { window.__xiantuStats.ignored++; return; }
+        settle('dismiss', null);
+      };
+      host.classList.add('ready');
+      if (timer) { clearTimeout(timer); timer = 0; }
+    };
+    frame.onload = () => {
+      if (settled || gen !== xiantuGen) return;
+      let href = '';
+      try { href = frame.contentWindow.location.href; } catch (e) { return; }
+      if (!href || href.indexOf('xiantu.html') < 0) return;
+      Object.keys(seen).forEach(k => { delete seen[k]; });
+      arm();
+    };
+    onPageShow = ev => {
+      if (!ev.persisted || settled || gen !== xiantuGen || !frame) return;
+      let alive = false;
+      try { alive = !!(frame.contentWindow && frame.contentWindow.xiantuOpening); } catch (e) { alive = false; }
+      if (alive) return;
+      host.classList.remove('ready');
+      frame.src = XIANTU_URL;
+    };
+    onKey = e => {
+      if (e.key !== 'Escape' || e.metaKey || e.ctrlKey || e.altKey || settled || gen !== xiantuGen) return;
+      e.preventDefault();
+      e.stopPropagation();
+      settle('dismiss', null);
+    };
+    window.addEventListener('pageshow', onPageShow);
+    window.addEventListener('keydown', onKey, true);
+    timer = setTimeout(() => { if (!settled && gen === xiantuGen) settle('fail', null); }, 12000);
+    frame.src = XIANTU_URL;
+  });
+  xiantuCurrent = promise;
+  const clear = () => { if (xiantuCurrent === promise) xiantuCurrent = null; };
+  promise.then(clear, clear);
+  return promise;
+}
+
+/* ================= 试炼入局笺 ================= */
+function trialBrief() {
+  return new Promise(res => {
+    const el = document.createElement('div');
+    el.className = 'ask trial-brief';
+    el.setAttribute('role', 'dialog');
+    el.setAttribute('aria-modal', 'true');
+    el.innerHTML = `<div class="ask-shade"></div>
+      <div class="ask-card trial-card">
+        <div class="trial-chop" aria-hidden="true">试炼</div>
+        <h3 class="trial-card-title">试炼境</h3>
+        <p class="trial-lead">以金丹初期之身入局。</p>
+        <p class="trial-rule"><i>起手</i><span>年四十，修为自零起，灵石一百二十。</span></p>
+        <p class="trial-rule"><i>所求</i><span>二十载内达到金丹中期。入局先择道基与丹纹。</span></p>
+        <p class="trial-rule"><i>期限</i><span>行动完整结算，恰满二十载仍可达标；超过期限不计成功。</span></p>
+        <p class="trial-rule"><i>卷末</i><span>达标即收卷，不入轮回簿。图鉴仍可解锁。</span></p>
+        <p class="trial-rule"><i>此身</i><span>灵根与名分仍随你所测、所拜。</span></p>
+        <div class="ask-btns">
+          <button class="brush-btn small ask-no" type="button"><span class="bb-ink"></span><span class="bb-text">且慢</span></button>
+          <button class="brush-btn small ask-ok" type="button" id="ask-ok"><span class="bb-ink"></span><span class="bb-text">入局</span></button>
+        </div>
+      </div>`;
+    document.body.appendChild(el);
+    const done = v => {
+      if (!askOpen) return;
+      askOpen = null;
+      el.classList.remove('open');
+      setTimeout(() => el.remove(), 320);
+      res(v);
+    };
+    askOpen = done;
+    el.querySelector('.ask-ok').onclick = () => done(true);
+    el.querySelector('.ask-no').onclick = () => done(false);
+    el.querySelector('.ask-shade').onclick = () => done(false);
+    requestAnimationFrame(() => { el.classList.add('open'); el.querySelector('.ask-ok').focus({ preventScroll: true }); });
+  });
+}
+
+/* ================= 墨笺问询：替代原生 confirm ================= */
+let askOpen = null;
+function inkConfirm(text, ok = '确定', danger = false, sub = '确定么？') {
+  return new Promise(res => {
+    const el = document.createElement('div'); el.className = 'ask'; el.setAttribute('role', 'dialog'); el.setAttribute('aria-modal', 'true');
+    el.innerHTML = `<div class="ask-shade"></div><div class="ask-card"><p class="ask-text"></p><p class="ask-sub"></p>
+      <div class="ask-btns"><button class="brush-btn small ask-no"><span class="bb-ink"></span><span class="bb-text">且慢</span></button>
+      <button class="brush-btn small ask-ok${danger ? ' danger' : ''}" id="ask-ok"><span class="bb-ink"></span><span class="bb-text"></span></button></div></div>`;
+    el.querySelector('.ask-text').textContent = text;
+    el.querySelector('.ask-sub').textContent = sub;
+    el.querySelector('.ask-ok .bb-text').textContent = ok;
+    document.body.appendChild(el);
+    const done = v => { if (!askOpen) return; askOpen = null; el.classList.remove('open'); setTimeout(() => el.remove(), 320); res(v); };
+    askOpen = done;
+    el.querySelector('.ask-ok').onclick = () => done(true);
+    el.querySelector('.ask-no').onclick = () => done(false);
+    el.querySelector('.ask-shade').onclick = () => done(false);
+    requestAnimationFrame(() => { el.classList.add('open'); el.querySelector('.ask-ok').focus({ preventScroll: true }); });
+  });
+}
+
+/* ================= 入道 ================= */
+let roll = null, rerolls = 2, testing = false;
+function resetCreate() {
+  roll = null; rerolls = 2; testing = false;
+  const trial = !!window.__trialStart;
+  const ch = document.querySelector('#scr-create .chapter');
+  const ban = $('#trial-banner');
+  if (ch) ch.textContent = trial ? '试炼境' : '第一卷';
+  if (ban) {
+    ban.hidden = !trial;
+    ban.textContent = trial ? '金丹二十载：年四十，灵石一百二十。先择道基与丹纹，二十载内达到金丹中期，达标即收卷，不入轮回簿。' : '';
+  }
+  paintWhoPick();
+  $('#inp-name').value = '';
+  $('#inp-name').disabled = false;
+  const whoPick = $('#who-pick'); if (whoPick) whoPick.hidden = false;
+  $('#lg-name').textContent = ''; $('#lg-stats').textContent = '';
+  const f = $('#lg-flavor'); f.textContent = trial ? '灵根随你。入局之后，已是金丹初期。' : '以指触石，可知灵根。'; f.className = 'lg-flavor dim';
+  $('#stone-hint').textContent = '点击测字 · 测灵根'; $('#btn-test').setAttribute('aria-label', '测灵根'); $('#btn-test').disabled = false;
+  $('#btn-start').hidden = true;
+  $$('.el').forEach(e => e.classList.remove('on'));
+  $('#stone-center').textContent = '测'; $('#stone-glow').style.opacity = 0;
+}
+function randName() { return pick(NAMES_XING) + pick(NAMES_MING); }
+function rollLinggen() {
+  const tot = LINGGEN.reduce((a, b) => a + b.w, 0); let r = Math.random() * tot, lg = LINGGEN[LINGGEN.length - 1];
+  for (const l of LINGGEN) { if ((r -= l.w) < 0) { lg = l; break; } }
+  const sh = [...ELEMENTS].sort(() => Math.random() - 0.5);
+  let lean = '';
+  if (!window.__trialStart && typeof Samsara !== 'undefined' && Samsara.peekLegacy) {
+    const leg = Samsara.peekLegacy();
+    if (leg && leg.naihe && leg.kind === 'mem' && leg.el && ELEMENTS.indexOf(leg.el) >= 0) lean = leg.el;
+  }
+  if (lean) {
+    const i = sh.indexOf(lean);
+    if (i > 0) { sh.splice(i, 1); sh.unshift(lean); }
+  }
+  const n = { tian: 1, shuang: 2, san: 3, si: 4, wei: 5 }[lg.id];
+  const els = lg.id === 'yi' ? [pick(['雷', '风', '冰'])] : sh.slice(0, n).sort((a, b) => ELEMENTS.indexOf(a) - ELEMENTS.indexOf(b));
+  const wx = clamp(3 + Math.floor(Math.random() * 5) + (Math.random() < 0.12 ? 2 : 0), 1, 10);
+  return { lg, els, wx, luck: Math.floor(Math.random() * 6) };
+}
+async function doTest() {
+  if (testing) return; testing = true;
+  const btn = $('#btn-test'); btn.disabled = true; $('#stone-hint').textContent = '正在测灵根……'; $('#btn-start').hidden = true;
+  const stone = $('#stone'), glow = $('#stone-glow'), center = $('#stone-center');
+  $$('.el').forEach(e => e.classList.remove('on'));
+  glow.style.opacity = 0; center.style.opacity = 0.3;
+  $('#lg-name').textContent = ''; $('#lg-stats').textContent = '';
+  const fl = $('#lg-flavor'); fl.className = 'lg-flavor dim'; fl.textContent = '灵气入石……';
+  stone.classList.remove('testing'); void stone.offsetWidth; stone.classList.add('testing');
+  const els = $$('.el');
+  for (let i = 0; i < 10; i++) {
+    const e = els[i % 5]; e.style.setProperty('--c', EL_HEX[e.textContent]); e.classList.add('on');
+    await sleep(110); e.classList.remove('on');
+  }
+  roll = rollLinggen();
+  const col = EL_HEX[roll.els[0]];
+  els.forEach(e => { if (roll.els.includes(e.textContent)) { e.style.setProperty('--c', EL_HEX[e.textContent]); e.classList.add('on'); } });
+  glow.style.background = `radial-gradient(circle, ${col}cc, ${col}00 70%)`; glow.style.opacity = roll.lg.id === 'wei' ? 0.25 : 0.85;
+  center.style.opacity = 1;
+  center.textContent = roll.lg.id === 'yi' || roll.lg.id === 'tian' ? roll.els[0] : roll.lg.id === 'wei' ? '杂' : cn(roll.els.length);
+  const nm = $('#lg-name');
+  nm.innerHTML = `<span class="lg-el"></span><span class="lg-n"></span>`;
+  nm.querySelector('.lg-el').textContent = roll.lg.id === 'wei' ? '' : roll.els.join('');
+  inkWrite(nm.querySelector('.lg-n'), roll.lg.name, { immediate: true, step: 120 });
+  fl.className = 'lg-flavor';
+  const d = inkWrite(fl, linggenFlavor(roll.lg, roll.els), { immediate: true, step: 16 });
+  setTimeout(() => {
+    const marks = ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十'];
+    const cells = marks.map((ch, i) => `<i class="${i + 1 === roll.wx ? 'on' : ''}">${ch}</i>`).join('');
+    $('#lg-stats').innerHTML = `<span>资质 <b>${roll.lg.word}</b> · 灵根</span><div class="wx-scale"><b>悟性 ${cn(roll.wx)} · ${wuxingWord(roll.wx)}</b><div class="wx-rule">${cells}</div><em>左愚钝 · 右天纵</em></div><p class="wx-note">灵根定资质，悟性另计，二者不互相换算。再测会把这两样重新掷过。</p>`;
+    $('#lg-stats').classList.add('bleed-in');
+  }, Math.min(d, 1600));
+  await sleep(900);
+  testing = false;
+  $('#btn-start').hidden = false;
+  if (rerolls > 0) { btn.disabled = false; btn.setAttribute('aria-label', `再测灵根·余${cn(rerolls)}次`); $('#stone-hint').textContent = `点击灵石再测 · 余${cn(rerolls)}次`; }
+  else { btn.setAttribute('aria-label', '天意已定'); $('#stone-hint').textContent = '天意已定'; }
+}
+function initCreate() {
+  $('#btn-create-back').onclick = async () => {
+    if (window.__mortalBaishan) { window.__mortalBaishan = false; $('#inp-name').disabled = false; enterMain(false); return; }
+    if (window.__villageDraft) {
+      const result = await VillageUI.open();
+      if(result.ok) { window.__villageDraft=result.draft; applyOpeningSex(result.draft.sex==='f'?'female':'male'); paintWhoPick(); }
+      else { clearOpeningSex(); initTitle(); unrollTo('title'); }
+    } else { clearOpeningSex(); initTitle(); unrollTo('title'); }
+  };
+  $('#btn-randname').onclick = () => { $('#inp-name').value = randName(); };
+  $('#btn-test').onclick = () => { if (testing || $('#btn-test').disabled) return; if (roll) { if (rerolls <= 0) return; rerolls--; } doTest(); };
+  $('#btn-start').onclick = async () => {
+    if (!roll) return;
+    if (window.__mortalBaishan) {
+      const choice = await openBaishan(roll);
+      if (!choice) return;
+      enterCultivation('sect', { lg: roll.lg, els: roll.els, wx: roll.wx, luck: roll.luck, choice });
+      $('#inp-name').disabled = false;
+      return;
+    }
+    let name = $('#inp-name').value.trim().replace(/\s+/g, '');
+    if (!name) { name = randName(); $('#inp-name').value = name; }
+    const origin = window.__villageDraft ? 'village' : await openOrigin();
+    if (!origin) return;
+    const choice = await openBaishan(roll);
+    if (!choice) return;
+    newGame(name, roll, choice, origin);
+  };
+  $('#inp-name').addEventListener('keydown', e => { if (e.key === 'Enter') e.target.blur(); });
+  window.__who = window.__who || { sex: 'm', mate: 'any' };
+  const pick = document.getElementById('who-pick');
+  if (pick && !pick.dataset.bound) {
+    pick.dataset.bound = '1';
+    pick.addEventListener('click', e => {
+      const b = e.target.closest('[data-k]'); if (!b) return;
+      const k = b.dataset.k, v = b.dataset.v;
+      if (k === 'sex' && (window.__openingSex === 'm' || window.__openingSex === 'f')) return;
+      window.__who[k] = v;
+      pick.querySelectorAll(`[data-k="${k}"]`).forEach(x => x.classList.toggle('on', x === b));
+    });
+  }
+}
+
+function newGame(name, r, choice, originId, lifeOptions) {
+  if (window.__resumeCreated) return window.__resumeCreated();
+  const villageDraft = window.__villageDraft;
+  if (r && (r._created || r._villageCreated)) return;
+  if (villageDraft && (villageDraft._created || !Village.valid(villageDraft))) return;
+  const mingDraft = !villageDraft && r && r.ming;
+  if (mingDraft && mingDraft._created) return;
+  const trial = !!window.__trialStart;
+  const mortalStart = !!(lifeOptions && lifeOptions.mortal);
+  const staged = typeof Samsara !== 'undefined' && Samsara.beginCreation;
+  let committed = null, recovery = null, entering = false;
+  function savedFallback() {
+    const message = committed && committed.uncertain
+      ? '新卷存档待核实，请稍后续卷。'
+      : '新卷已存，入卷未成。请续卷，或刷新后续卷。';
+    window.__resumeCreated = () => resumeCreated(true);
+    toast(message);
+    if (recovery) return;
+    recovery = document.createElement('div');
+    recovery.setAttribute('role', 'alertdialog');
+    recovery.setAttribute('aria-label', message);
+    recovery.setAttribute('aria-modal', 'true');
+    recovery.className = 'creation-recovery';
+    const text = document.createElement('p'); text.textContent = message;
+    const retry = document.createElement('button'); retry.className = 'brush-btn'; retry.textContent = '续卷';
+    retry.onclick = () => resumeCreated(true);
+    recovery.appendChild(text); recovery.appendChild(retry); document.body.appendChild(recovery);
+    retry.focus();
+  }
+  function resumeCreated(retry) {
+    if (entering) return;
+    entering = true;
+    try {
+      // Read the committed slot on retry; never call Core.newState/consumeLegacy again.
+      if (retry) {
+        if (committed.uncertain) {
+          const box = JSON.parse(localStorage.getItem(Slots.KEY) || 'null');
+          const slot = box && box.slots && box.slots[committed.index];
+          if (!slot || JSON.stringify(slot.data) !== JSON.stringify(S)) throw Error('saved slot unverified');
+          committed.uncertain = false;
+        }
+        const saved = Slots.read(committed.index);
+        if (!saved) throw Error('saved slot unavailable');
+        S = saved;
+        if (villageDraft) VillageUI.clear();
+      }
+      const started = S;
+      const entered = enterMain(!!retry);
+      return Promise.resolve(entered).then(() => {
+        if (recovery) { recovery.remove(); recovery = null; }
+        window.__resumeCreated = null;
+        if (!trial && !mortalStart) setTimeout(() => { if (S === started && curScreen === 'main' && !(S.life && S.life.goal)) openGoalPicker(); }, 450);
+      }).catch(savedFallback).finally(() => { entering = false; });
+    } catch (e) { entering = false; savedFallback(); }
+  }
+  try {
+  if (staged) Samsara.beginCreation();
+  if (!trial) {
+    const meta = typeof Samsara !== 'undefined' ? Samsara.loadMeta(true) : JSON.parse(Slots.readEffect('moxian.meta') || '{}');
+    if (meta.bridge && meta.bridge.open) throw Error('pending bridge choice');
+  }
+  let legacy = null;
+  if (!trial && !villageDraft) {
+    if (staged) legacy = Samsara.consumeLegacy();
+    else { legacy = JSON.parse(Slots.readEffect(LEGACY_KEY) || 'null'); }
+  }
+  const orgId = choice && choice.id !== 'free' ? choice.id : null;
+  const free = !!(choice && choice.id === 'free');
+  const rr = Object.assign({}, r, { org: orgId, free, trial, origin: originId || 'qingshi' });
+  const candidate = Core.newState(name, rr, legacy);
+  if (mortalStart) {
+    candidate.mortal = true;
+    candidate.childhood = Childhood.initial();
+    Adulthood.ensure(candidate); Growth.ensure(candidate);
+    candidate.months = 6 * 12; candidate.day = 1; candidate.ls = 4 + (legacy && legacy.kind === 'home' ? 2 : 0);
+    candidate.items['村塾名帖'] = 1;
+    candidate.gf = null; candidate.gfs = {}; candidate.aux = [];
+    candidate.sect.org = null; candidate.sect.rank = -1; candidate.sect.free = true;
+    candidate.flags.guide = 0;
+    Core.sync(candidate);
+  }
+  if (villageDraft && !trial) {
+    Village.apply(candidate, villageDraft);
+    candidate.who = { sex: villageDraft.sex, mate: (window.__who || {}).mate || 'any' };
+  }
+
+  if (!trial && typeof Samsara !== 'undefined' && Samsara.loadMeta) candidate.flags.lives = Samsara.loadMeta().lives | 0;
+  if (typeof Folio !== 'undefined') {
+    const w = window.__who || {};
+    Folio.setWho(candidate, villageDraft ? villageDraft.sex : w.sex || 'm', w.mate || 'any');
+    Folio.boot(candidate);
+  }
+  if (!trial && mingDraft && typeof Mingge !== 'undefined') Mingge.apply(candidate, mingDraft);
+  if (!trial && typeof Samsara !== 'undefined') {
+    const meta = Samsara.loadMeta();
+    const firstLife = !legacy && !(meta.guide) && !(meta.lives > 0);
+    if (firstLife && !mortalStart) candidate.flags.guide = 1;
+  }
+  const lgDesc = (r.lg.id === 'wei' ? '' : r.els.join('')) + r.lg.name;
+  const o = orgId && ORGS[orgId];
+  let sectLine;
+  if (free) {
+    sectLine = r.lg.id === 'wei'
+      ? `测得伪灵根，各宗门前无立锥之地。你折叠拜山帖，独自往深山里去了——无门无派，也好。`
+      : `测得${lgDesc}。你拜了山帖，却在山门外止步：此生不入任何门户。云海翻涌，像在鼓掌，也像在叹气。`;
+  } else if (o) {
+    const rank = Core.rankName(candidate);
+    const gf0 = candidate.gf && GONGFA[candidate.gf] ? GONGFA[candidate.gf].name : '入门心法';
+    sectLine = `测得${lgDesc}。你投帖${o.name}，赐下${rank}名分，领了腰牌与一卷《${gf0}》。${o.trait || ''}`;
+  } else {
+    sectLine = `测得${lgDesc}。山门之内，尘埃落定。`;
+  }
+  const who = (typeof Juan !== 'undefined' && Juan.originName) ? Juan.originName(candidate) : '青石镇少年';
+  if (trial) {
+    appendInitialLog(candidate, {
+      title: '试炼',
+      text: `今日试炼：以金丹初期之身入局。出身${who}，名${name}，年四十，随身灵石一百二十。先择道基与丹纹，二十载内达到金丹中期，达标即收卷。行动完整结算，超过期限才达标不计成功；此局不入轮回簿，可解锁图鉴。`,
+      cls: 'gold',
+      tags: [{ t: '金丹初期', c: 'gold' }, { t: '二十载', c: 'gold' }]
+    });
+  } else if (mortalStart) {
+    appendInitialLog(candidate, { title: '村塾名帖', text: `六岁初春，你名${name}，第一次在村塾名册上写下自己的名字。今日之前是家中孩童，今日之后，往后的路由一幕幕经历写起。`, cls: 'sys' });
+  } else {
+    const line = (typeof Juan !== 'undefined' && Juan.originLine) ? Juan.originLine(candidate) : ('你名' + name + '，青石镇人氏，年方十\u2060六。');
+    appendInitialLog(candidate, { text: `大衍历三千七百二十一年，春。天下开山收徒。${line}`, cls: 'sys' });
+  }
+  if (!mortalStart) appendInitialLog(candidate, { text: sectLine });
+  if (!trial && candidate.ming && candidate.ming.on && typeof Mingge !== 'undefined' && Mingge.logs) {
+    Mingge.logs(candidate).forEach(row => appendInitialLog(candidate, row));
+  }
+  if (legacy && legacy.naihe && legacy.kind && legacy.kind !== 'none') {
+    const tags = candidate._legacyTags || [{ t: '奈何', c: 'gold' }];
+    const line = legacy.kind === 'page'
+      ? '行囊底上多了一卷残页，字缺了半边。它还不成主修，要等你自己把它走成一条路。'
+      : legacy.kind === 'bond'
+        ? '有一个名字在心里停了一停。不是这世认识的，却像会在路上遇见。'
+        : '入山那夜，你梦见一条很浅的河。醒来后，有些道理像在骨头里。';
+    appendInitialLog(candidate, { title: '奈何', text: line, tags, cls: 'gold' });
+  } else if (legacy) {
+    const tags = candidate._legacyTags || [{ t: '前世残念', c: 'gold' }];
+    appendInitialLog(candidate, { text: '入山那夜，你梦见一柄断剑沉在云海深处，剑身上刻着一个陌生的名字。醒来时，许多道理竟像早已懂得。', tags, cls: 'gold' });
+    const bits = [];
+    if (legacy.cave) bits.push('一枚旧钥');
+    if (legacy.auxPage) bits.push('半页残卷');
+    if (legacy.canhun) bits.push('一声旧器的鸣');
+    if (bits.length) appendInitialLog(candidate, { title: '轮回', text: `除了那些说不清的道理，你还带着${bits.join('、')}。它们会在该出现的时候出现。`, cls: 'breath' });
+  }
+  if (candidate.flags && candidate.flags._legacyJoinText) {
+    appendInitialLog(candidate, { text: candidate.flags._legacyJoinText, tags: [{ t: '门派印记', c: 'gold' }], cls: 'gold' });
+    delete candidate.flags._legacyJoinText;
+  }
+  appendInitialLog(candidate, { text: trial ? '试炼钟响。此去不问来世，只问此身能走多远。' : mortalStart ? '名帖收入行囊。村塾的晨钟响了，先生拿来一册旧皇历，要教你把往后的日子记下来。' : '山门之外，云海翻涌。此去长生，不问归期。', cls: 'gold', div: !trial && !mortalStart });
+  if (!trial && candidate.flags.legacyNote) appendInitialLog(candidate, { title: '轮回札记', text: candidate.flags.legacyNote, cls: 'breath' });
+  if (legacy && legacy.thread) appendInitialLog(candidate, { title: '前世绝笔', text: legacy.thread, cls: 'breath' });
+  else if (candidate.flags && candidate.flags.threadText) appendInitialLog(candidate, { title: '前世绝笔', text: candidate.flags.threadText, cls: 'breath' });
+  const target = window.__slotTarget;
+  const effects = staged ? Samsara.creationEffects() : legacy ? {
+    'moxian.meta': Slots.readEffect('moxian.meta'), 'moxian.legacy': null
+  } : null;
+  const result = Slots.createEmpty(target, candidate, effects);
+  if (!result.ok) { toast(result.err); return; }
+  // The persistence boundary precedes every fallible UI/mirror operation.
+  committed = result;
+  S = candidate;
+  if (r) r._created = true;
+  if (villageDraft) { villageDraft._created = true; if (r) r._villageCreated = true; }
+  if (mingDraft) mingDraft._created = 1;
+  window.__villageDraft = null;
+  window.__openingSex = null;
+  window.__trialStart = false;
+  window.__slotTarget = null;
+  playTick = Date.now();
+  if (result.uncertain || result.readUnavailable) { savedFallback(); return; }
+  if (staged) Samsara.endCreation(true);
+  else if (legacy) Slots.readEffect(LEGACY_KEY);
+  if (villageDraft) VillageUI.clear();
+  return resumeCreated(false);
+  } catch (e) {
+    if (committed) savedFallback();
+    else toast('开卷未成，请稍后重试');
+  } finally {
+    if (staged) { try { Samsara.endCreation(false); } catch (e) { /* Commit status is already settled. */ } }
+  }
+}
+
+function paintLunhuiSeal() {
+  const el = $('#lunhui-seal');
+  const n = $('#lunhui-seal-n');
+  if (!el) return;
+  let lives = 0;
+  if (typeof Samsara !== 'undefined' && Samsara.loadMeta) lives = Samsara.loadMeta().lives | 0;
+  if (lives < 1) { el.hidden = true; return; }
+  el.hidden = false;
+  const word = cn(lives + 1);
+  if (n) n.textContent = word;
+  el.setAttribute('aria-label', '第' + word + '世');
+}
+async function openOrigin() {
+  const all = (typeof Juan !== 'undefined' && Juan.ORIGINS) ? Juan.ORIGINS : null;
+  const meta = (typeof Samsara !== 'undefined' && Samsara.loadMeta) ? Samsara.loadMeta() : null;
+  const list = all ? all.filter(o => !o.prologue && (!o.need || (meta && meta.boons && meta.boons[o.need]))) : null;
+  const pc = $('#origin-cer');
+  if (!pc || !list || !list.length) return 'qingshi';
+  return new Promise(resolve => {
+    pc.hidden = false; pc.className = 'path-cer origin-cer go';
+    $('#origin-seal').textContent = '身';
+    $('#origin-title').textContent = '出身';
+    const opts = $('#origin-opts'); opts.innerHTML = ''; opts.className = 'path-cer-opts';
+    const foot = $('#origin-foot'); foot.hidden = false;
+    const conf = $('#origin-confirm');
+    conf.disabled = true; conf.classList.add('dim');
+    const hint = $('#origin-hint'); if (hint) hint.textContent = '点选一种出身，再落墨';
+    inkWrite($('#origin-lead'), '灵根未测之前，你已在世上活了十六年。这一页出身，会跟着你走进山门，也会在卷末轻轻偏一下。', { immediate: true, step: 22 });
+    let selected = null;
+    list.forEach((o, i) => {
+      const btn = document.createElement('button');
+      btn.className = 'path-opt'; btn.type = 'button'; btn.style.animationDelay = (120 + i * 60) + 'ms';
+      btn.innerHTML = `<span class="po-seal${(o.seal || '').length > 1 ? ' wide' : ''}"></span><div class="po-body"><b></b><em></em><p></p></div>`;
+      btn.querySelector('.po-seal').textContent = o.seal;
+      btn.querySelector('b').textContent = o.name;
+      btn.querySelector('em').textContent = '偏向 · ' + o.lean;
+      btn.querySelector('p').textContent = o.prose;
+      btn.onclick = () => {
+        selected = o;
+        opts.querySelectorAll('.path-opt').forEach(x => x.classList.remove('on'));
+        btn.classList.add('on');
+        conf.disabled = false; conf.classList.remove('dim');
+        if (hint) hint.textContent = '确认后落墨 · Enter 亦可';
+      };
+      opts.appendChild(btn);
+    });
+    conf.onclick = async () => {
+      if (!selected || conf.disabled) return;
+      opts.classList.add('locked');
+      if (typeof MoAudio !== 'undefined') MoAudio.play('stamp');
+      pc.classList.add('leave'); await sleep(640);
+      pc.hidden = true; pc.className = 'path-cer origin-cer';
+      resolve(selected.id);
+    };
+  });
+}
+
+async function openBaishan(roll) {
+  const list = (typeof baishanAllowed === 'function' ? baishanAllowed(roll.lg.id) : BAISHAN);
+  const pc = $('#baishan'); if (!pc || !list || !list.length) return { id: roll.lg.id === 'wei' ? 'sx' : 'qm' };
+  return new Promise(resolve => {
+    pc.hidden = false; pc.className = 'path-cer baishan go';
+    $('#baishan-seal').textContent = '拜';
+    $('#baishan-title').textContent = '拜山帖';
+    $('#baishan-lead').textContent = '';
+    const opts = $('#baishan-opts'); opts.innerHTML = ''; opts.className = 'path-cer-opts';
+    const foot = $('#baishan-foot'); foot.hidden = false;
+    const conf0 = $('#baishan-confirm');
+    conf0.disabled = true;
+    conf0.classList.add('dim');
+    const h0 = $('#baishan-hint'); if (h0) h0.textContent = '点选一家门户，再投帖';
+    const lead = roll.lg.id === 'wei'
+      ? '伪灵根不为大多数宗门所收。帖上只余散修盟与无门两途——选一条，活下去。'
+      : '灵根已定。山海之间，数家门户张帖招徒。一帖既投，便是数年乃至数十年的路——慎择。';
+    inkWrite($('#baishan-lead'), lead, { immediate: true, step: 22 });
+    let selected = null;
+    list.forEach((b, i) => {
+      const btn = document.createElement('button');
+      btn.className = 'path-opt'; btn.style.animationDelay = (160 + i * 80) + 'ms';
+      btn.innerHTML = `<span class="po-seal">${esc(b.seal)}</span><div class="po-body"><b>${esc(b.name)}</b><em>${esc(b.sub)}</em><p></p></div>`;
+      btn.querySelector('p').textContent = b.prose;
+      btn.type = 'button';
+      btn.onclick = () => {
+        selected = b;
+        opts.querySelectorAll('.path-opt').forEach(x => x.classList.remove('on'));
+        btn.classList.add('on');
+        foot.hidden = false;
+        const conf = $('#baishan-confirm');
+        conf.disabled = false;
+        conf.classList.remove('dim');
+        const lab = conf.querySelector('.bb-text');
+        if (lab) lab.textContent = b.id === 'free' ? '无门而去' : '投帖拜入';
+        const h = $('#baishan-hint'); if (h) h.textContent = '确认后投帖 · Enter 亦可';
+      };
+      opts.appendChild(btn);
+    });
+    $('#baishan-confirm').onclick = async () => {
+      if (!selected || $('#baishan-confirm').disabled) return;
+      opts.classList.add('locked');
+      if (typeof MoAudio !== 'undefined') MoAudio.play('stamp');
+      pc.classList.add('leave'); await sleep(700);
+      pc.hidden = true; pc.className = 'path-cer baishan';
+      resolve(selected);
+    };
+  });
+}
+
+function openMortalBaishan() {
+  window.__mortalBaishan = true;
+  resetCreate();
+  $('#inp-name').value = S.name;
+  $('#inp-name').disabled = true;
+  const who = $('#who-pick'); if (who) who.hidden = true;
+  unrollTo('create');
+}
+function enterCultivation(route, tested) {
+  Childhood.complete(S, route);
+  S.mortal = false;
+  S.flags.rootRevealed = 1;
+  S.flags.guide = 1;
+  if (tested) {
+    S.lg = { id: tested.lg.id, name: tested.lg.name, mult: tested.lg.mult, bt: tested.lg.bt, sect: tested.lg.sect };
+    S.lgEls = tested.els.slice(); S.wx = tested.wx; S.luck = tested.luck;
+  }
+  S.gf = null;
+  const org = route === 'sect' && tested && tested.choice && tested.choice.id !== 'free' ? tested.choice.id : null;
+  if (org) Core.join(S, org, []);
+  else S.sect.free = true;
+  const gf = org && ORGS[org] && ORGS[org].startGf ? ORGS[org].startGf : 'qingming';
+  Core.learn(S, gf, []);
+  const entryText = route === 'sect' ? '测灵石上的光落定。你得了功法与去向，今日起，才算真正踏入仙途。' : route === 'insight' ? '你把这些年做过的活、见过的人和读过的句子慢慢想了一遍。呼吸自然下来，一缕灵气随之入体。不是谁忽然选中你，是往日的经历终于有了归处。' : '你依残篇调匀呼吸，终于察觉到一缕灵气入体。没有仙门替你开门，是你自己走到了这里。';
+  pushLog({ title: '正式入道', text: entryText, cls: 'gold', div: true });
+  const growthLine = Growth.enterCultivation(S, route);
+  if (growthLine) pushLog({ title: '往日所学', text: growthLine, cls: 'gold' });
+  Core.sync(S); save();
+  window.__mortalBaishan = false;
+  enterMain(false);
+}
+function finishChildhood(route) {
+  if (!S || !S.childhood) return;
+  if (route === 'dead') { checkEnd(); return; }
+  if (route === 'self' || route === 'sect') {
+    if (!Childhood.choices(S).some(c => c.id === route && c.enabled)) return;
+    if (route === 'sect') { openMortalBaishan(); return; }
+    enterCultivation('self', null);
+    return;
+  }
+  Childhood.complete(S, route);
+  S.mortal = true;
+  const adultText = Adulthood.begin(S, route);
+  pushLog({ title: '十六岁 · 童年卷终', text: adultText, cls: 'gold', div: true });
+  save(); enterMain(false);
+}
+window.__childhoodEnter = finishChildhood;
+window.__childhoodExit = returnToTitle;
+
+/* ================= 主界面 ================= */
+function enterMain(fromSave) {
+  if (unrollTo.turn) return unrollTo.turn;
+  const logs = S.log.slice(-30);
+  const passage = curScreen === 'title' || curScreen === 'create';
+  return unrollTo('main', () => {
+    $('#log').innerHTML = '';
+    render();
+    // Passage owns the reveal; do not restart old sentences underneath it.
+    logs.forEach((e, i) => renderEntry(e, passage ? false : fromSave ? i >= logs.length - 2 : true));
+    const l = $('#log'); l.scrollTop = fromSave ? l.scrollHeight : 0;
+  }).then(() => {
+    if(S.mortal&&S.childhood&&S.childhood.active&&S.childhood.storyMode&&ChildhoodStory.current(S).id==='calendar')setTimeout(()=>{if(S.mortal&&S.childhood.active&&curScreen==='main'&&!uiBlocked())openNextChildhood();},fromSave?700:1100);
+    if (S.flags && S.flags.trial) {
+      if (!S.dead) ensurePendingPath().then(() => { if (!S.dead && typeof JHUI !== 'undefined') JHUI.resume(); });
+    } else {
+      if (typeof JHUI !== 'undefined') setTimeout(JHUI.resume, 700);
+      if (fromSave) setTimeout(() => ensurePendingPath(), 900);
+    }
+    if (fromSave && typeof Folio !== 'undefined' && Folio.needSex(S)) setTimeout(() => openSexSheet(), 1200);
+    if (S.flags && S.flags.guide) setTimeout(() => maybeGuide(), fromSave ? 600 : 1100);
+  });
+}
+function clipMark(text) {
+  let t = String(text || '').replace(/\s+/g, '');
+  const i = t.search(/[。！？]/);
+  if (i >= 6 && i <= 28) return t.slice(0, i);
+  return t.length > 24 ? t.slice(0, 24) : t;
+}
+function noteMark(e, state = S) {
+  if (!state || !e || !e.title || e.guide) return;
+  state.marks = state.marks || [];
+  const last = state.marks[state.marks.length - 1];
+  if (last && last.t === e.title) return;
+  state.marks.push({ t: e.title, y: state.age | 0, c: e.cls || '', d: clipMark(e.text) });
+  if (state.marks.length > 24) state.marks.splice(0, state.marks.length - 24);
+  if (typeof Life !== 'undefined' && Life.note) Life.note(state, { y: state.age | 0, t: e.title, d: clipMark(e.text), k: e.cls || '' });
+}
+function appendInitialLog(state, e) {
+  if (typeof Calendar !== 'undefined') {
+    e.cal = Calendar.stamp(state);
+    e.time = Calendar.owned(state) ? Calendar.short(state) : Core.timeLabel(state);
+  } else e.time = Core.timeLabel(state);
+  if (typeof Juan !== 'undefined' && Juan.onLog) Juan.onLog(state, e);
+  noteMark(e, state);
+  state.log.push(e); if (state.log.length > 60) state.log.splice(0, state.log.length - 60);
+}
+function pushLog(e) {
+  appendInitialLog(S, e);
+  if (curScreen === 'main' && !document.getElementById('scr-main').hidden) {
+    renderEntry(e, true); scrollLog();
+    if (e.colo) renderSeals();
+  }
+}
+function renderEntry(e, animate) {
+  const log = $('#log');
+  if (e.div && log.children.length) {
+    const d = document.createElement('div'); d.className = 'entry-div';
+    d.innerHTML = Ink.brushSVG(300, 10, (log.children.length * 7) % 97 + 1); log.appendChild(d);
+  }
+  const el = document.createElement('div'); el.className = 'entry ' + (e.cls || '') + (animate ? '' : ' fresh');
+  const t = document.createElement('div'); t.className = 'entry-time'; t.textContent = e.time || ''; el.appendChild(t);
+  if (e.title) { const h = document.createElement('div'); h.className = 'entry-title'; h.textContent = e.title; el.appendChild(h); }
+  if (e.colo) { const c = document.createElement('div'); c.className = 'entry-colo'; c.textContent = e.colo; el.appendChild(c); }
+  const p = document.createElement('div'); p.className = 'entry-text'; el.appendChild(p);
+  log.appendChild(el);
+  let delay = 0;
+  const shown = voice(e.text);
+  if (animate) { delay = inkWrite(p, shown); t.classList.add('bleed-in'); } else p.textContent = shown;
+  if (e.tags && e.tags.length) {
+    const tg = document.createElement('div'); tg.className = 'entry-tags';
+    tg.innerHTML = e.tags.map(x => `<span class="${x.c || ''}">${x.t}</span>`).join('');
+    if (animate) { tg.style.opacity = 0; setTimeout(() => { tg.style.opacity = ''; tg.classList.add('bleed-in'); }, delay); }
+    el.appendChild(tg);
+  }
+  while (log.children.length > 80) log.removeChild(log.firstChild);
+  syncLogTimes();
+  syncColo();
+}
+// Group only consecutive dated entries. Recompute after trimming so the first
+// remaining entry always owns its date; old saves keep their original log data.
+function logYear(value) {
+  const i = value.indexOf(' · ');
+  return i > 0 ? value.slice(0, i) : '';
+}
+function logSeason(value) {
+  const i = value.indexOf(' · ');
+  return i > 0 ? value.slice(i + 3) : '';
+}
+function syncLogTimes() {
+  let previous = null, previousTime = '';
+  document.querySelectorAll('#log .entry').forEach(entry => {
+    const time = entry.querySelector('.entry-time');
+    const value = time ? (time._full || time.textContent || '') : '';
+    if (time && value) time._full = value;
+    const continued = !!(value && previous && value === previousTime);
+    const year = logYear(value);
+    const season = logSeason(value);
+    const sameYear = !!(season && year && year === logYear(previousTime) && !continued);
+    entry.classList.toggle('entry-cont', continued);
+    entry.classList.toggle('entry-year', sameYear);
+    entry.classList.remove('entry-followed');
+    if (time) {
+      time.hidden = continued || !value;
+      time.textContent = sameYear ? season : value;
+    }
+    const divider = entry.previousElementSibling;
+    if (divider && divider.classList.contains('entry-div')) divider.hidden = continued;
+    if (continued) previous.classList.add('entry-followed');
+    previous = entry; previousTime = value;
+  });
+}
+function syncColo() {
+  const last = (S && S.colophon && S.colophon.length) ? S.colophon[S.colophon.length - 1] : null;
+  document.querySelectorAll('#log .entry-colo').forEach(colo => {
+    const title = colo.parentElement && colo.parentElement.querySelector('.entry-title');
+    const onMargin = !!(last && colo.textContent === last.line && title && title.textContent === last.t);
+    colo.hidden = onMargin;
+  });
+}
+function scrollLog() { const l = $('#log'); requestAnimationFrame(() => l.scrollTop = l.scrollHeight); }
+
+// 单行自适应：放不下就逐级缩小字号，绝不折行
+function fitLine(el, max, min) {
+  if (!el || !el.clientWidth) return;
+  let f = max; el.style.fontSize = f + 'px'; el.style.letterSpacing = '';
+  while (el.scrollWidth > el.clientWidth + 0.5 && f > min) { f -= 0.5; el.style.fontSize = f + 'px'; el.style.letterSpacing = '0.02em'; }
+}
+function nextRealmLine() {
+  if (!S || S.ascended) return '已逾凡境';
+  if (S.mortal && S.adult && S.adult.started) return Adulthood.nextLine(S);
+  if (S.mortal) {
+    if (S.childhood && S.childhood.active && S.childhood.storyMode) return ChildhoodStory.nextLine(S);
+    if (!S.flags.firstLessonDone) return '先去窗下读书 · 先生会教你写下第一字';
+    if (!S.flags.firstErrandDone) return '替家中送米 · 先认认邻屋与老树下';
+    if (S.age < 9) return '日子在村中 · 可去溪边认草认路';
+    if (!Calendar.owned(S) && S.age < 12) return S.flags.calendarHint ? '先读熟旧历 · 十二岁再帮先生换新历' : '去祠堂看旧历 · 先生知道它的来历';
+    if (!Calendar.owned(S)) return '十二岁 · 谋生页选“帮先生整理新历”，三日可成';
+    if (S.age < 16 && S.childhood.active) return '旧书、钟声和远路 · 仙缘要靠自己认出来';
+    if (S.childhood.active) return '十六岁 · 童年将合，先择留乡或去镇里';
+    return S.childhood.fragment ? '吐纳残篇已得 · 谋生页可尝试入道' : '尚未入道 · 谋生页可寻访仙缘';
+  }
+  const trial = Core.trialStatus(S);
+  if (trial) return '试炼 · 目标金丹中期 · ' + (trial.result ? '已收卷' : '余' + cnDur(Math.ceil(trial.left)));
+  const r = R();
+  const major = (typeof NEXT_REALM_NAME !== 'undefined' && NEXT_REALM_NAME[S.realm]) || '飞升';
+  if (bottleneck()) return `本境已满 · 下一境 ${major} · 卷下可破境`;
+  if (isLast()) return `本层将满 · 下一境 ${major} · 小境自升`;
+  return `下一层 ${r.stages[S.stage + 1]} · 小境自升 · 下一境 ${major}`;
+}
+let shownRealm = null;
+const prev = {};
+const tweens = {};
+function setText(sel, v) {
+  const el = $(sel); if (!el) return; v = String(v);
+  if (prev[sel] === v) return;
+  const old = prev[sel]; prev[sel] = v;
+  if (old === undefined || FX.reduced() || document.body.dataset.screen !== 'main' || document.body.classList.contains('paper-turning')) { el.textContent = v; return; }
+  // 阿拉伯数字（如 修为 31 / 160）：数值滚动递增
+  const na = old.match(/^(\d+)( \/ .*)$/), nb = v.match(/^(\d+)( \/ .*)$/);
+  if (na && nb && na[2] === nb[2]) {
+    const a = +na[1], b = +nb[1], t0 = performance.now(), D = 900;
+    cancelAnimationFrame(tweens[sel]);
+    const step = now => { const k = Math.min(1, (now - t0) / D), e = 1 - Math.pow(1 - k, 3);
+      el.textContent = Math.round(a + (b - a) * e) + nb[2]; if (k < 1) tweens[sel] = requestAnimationFrame(step); };
+    tweens[sel] = requestAnimationFrame(step); return;
+  }
+  // 汉字数值：自下而上翻入
+  el.innerHTML = ''; const sp = document.createElement('span'); sp.className = 'roll-in'; sp.textContent = v; el.appendChild(sp);
+}
+function render() {
+
+  if (!S) return; sync();
+  const trialEnd = Core.trialStatus(S);
+  if (trialEnd && trialEnd.result) checkEnd();
+  const r = R();
+  setText('#h-realm', S.mortal ? '凡身' : r.name); setText('#h-stage', S.mortal ? '人间' : r.stages[S.stage]);
+  const trialSeal = $('#trial-seal');
+  if (trialSeal) trialSeal.hidden = !(S.flags && S.flags.trial);
+  const lun = $('#lunhui-hud');
+  if (lun) {
+    const lv = S.flags ? (S.flags.lives | 0) : 0;
+    if (S.flags && S.flags.trial || lv < 1) lun.hidden = true;
+    else { lun.hidden = false; lun.textContent = cn(lv + 1) + '世'; }
+  }
+  setText('#h-name', S.name);
+  const cr = typeof courtRankName === 'function' ? courtRankName(S) : '';
+  const sexMark = (typeof Folio !== 'undefined' && S.who && S.who.sex) ? ({ f: '女', n: '不言', m: '男' }[Folio.sex(S)] || '') : '';
+  const adultCareer = S.adult && S.adult.started ? Adulthood.CAREERS.find(c => c.id === S.adult.career) : null;
+  setText('#h-sub', S.mortal ? `${adultCareer ? adultCareer.name : S.adult && S.adult.started ? '人间谋生' : '村中凡人'}${sexMark ? ' · ' + sexMark : ''} · 灵根未测` : `${Core.rankName(S)}${cr ? ' · ' + cr : ''}${sexMark ? ' · ' + sexMark : ''} · ${S.lg.id === 'wei' ? '' : S.lgEls.join('')}${S.lg.name}`);
+  setText('#play-tab-sect', S.mortal ? '生计' : '宗门');
+  setText('#play-tab-cult', S.mortal ? '技艺' : '修持');
+  const sideSectTitle = document.querySelector('#side-sect h3'); if (sideSectTitle) sideSectTitle.textContent = S.mortal ? '生计' : '宗门';
+  const sideCultTitle = document.querySelector('#side-cult h3'); if (sideCultTitle) sideCultTitle.textContent = S.mortal ? '技艺' : '修持';
+  renderPathSeals();
+  const so = Core.org(S); $('#sect-seal-t').textContent = so ? so.seal : '游';
+  $('#btn-sect').setAttribute('aria-label', S.mortal ? '生计' : '宗门');
+  $('#btn-sect').classList.toggle('ready', !!(so && Core.canPromote(S).ok));
+  fitLine($('#h-sub'), document.documentElement.dataset.font === 'lg' ? 13 : 12, 11);
+  const rq = req(); if (S.xw > rq && isLast()) S.xw = rq;
+  const craft = S.childhood ? Object.values(S.childhood.skills).reduce((a, b) => a + b, 0) : 0;
+  const p = S.mortal ? clamp(craft / 24, 0, 1) : clamp(S.xw / rq, 0, 1);
+  const fill = $('#xw-fill'); fill.parentElement.style.setProperty('--p', (p * 100).toFixed(1) + '%');
+  fill.classList.toggle('full', !S.mortal && bottleneck());
+  setText('.bar-xw .bar-label', S.mortal ? '技艺' : '修为');
+  setText('#xw-num', S.mortal ? `${Math.floor(craft)} 点` : `${fmtNum(S.xw)} / ${fmtNum(rq)}`);
+  const lifeLeft = clamp((S.lifespan - S.age) / (S.lifespan - 16 || 1), 0, 1);
+  const inc = $('.incense'); inc.style.setProperty('--life', (Math.max(0.02, lifeLeft) * 100).toFixed(1) + '%');
+  setText('#life-num', `${S.age} / ${S.lifespan}`);
+  const lowLife = S.lifespan - S.age <= Math.max(6, (S.lifespan - 16) * 0.12);
+  const thinLife = lifeLeft < 1 / 3;
+  $('.bar-life').classList.toggle('low', lowLife);
+  $('.bar-life').classList.toggle('thin', thinLife && !lowLife);
+  const nx = $('#next-line');
+  if (nx) nx.textContent = nextRealmLine();
+  const season = Math.floor((S.months % 12) / 3);
+  setText('#c-age', cn(S.age)); setText('#c-season', ['春', '夏', '秋', '冬'][season]);
+  setText('#h-time', typeof Calendar !== 'undefined' ? Calendar.short(S) : cn(S.age) + '岁 · ' + ['春', '夏', '秋', '冬'][season]);
+  FX.setSeason(season); FX.setGold(S.realm || 0);
+  if (typeof MoAudio !== 'undefined') MoAudio.setSeason(season);
+  const nextRealm = String(S.ascended ? 5 : S.realm);
+  if (shownRealm != null && shownRealm !== nextRealm && document.body.dataset.screen === 'main' && !snappy()) {
+    document.body.classList.add('realm-shift');
+    clearTimeout(render._rs);
+    render._rs = setTimeout(() => document.body.classList.remove('realm-shift'), 980);
+  }
+  if (shownRealm !== nextRealm) { shownRealm = nextRealm; document.body.dataset.realm = nextRealm; drawMountains(true, { yield: document.body.dataset.screen === 'main' && !snappy() }); }
+  else document.body.dataset.realm = nextRealm;
+  document.body.dataset.season = season;
+  // 时辰感：按月份内进度微移（晨／午／暮），只影响纸色，不改玩法
+  const mIn = S.months % 3; // 0..2 within season quarter-ish
+  document.body.dataset.tod = mIn === 0 ? 'dawn' : mIn === 1 ? 'noon' : 'dusk';
+  setText('#c-wx', cn(S.wx)); setText('#c-xj', xinjingWord(S.xj)); setText('#c-ls', S.ls > 9999 ? fmtNum(S.ls) : cn(S.ls));
+  setText('#h-ls', fmtNum(S.ls));
+  const chipC = $('#chip-court');
+  if (chipC) {
+    const on = !!(S.court && S.court.rank >= 0);
+    chipC.hidden = !on;
+    if (on) setText('#c-court', courtRankName(S) || '白身');
+  }
+  const chipG = $('#chip-goal');
+  if (chipG) {
+    const gn = (typeof Life !== 'undefined' && Life.goalName) ? Life.goalName(S) : '';
+    chipG.hidden = !gn;
+    if (gn) setText('#c-goal', gn);
+  }
+  const tm = Core.timeMonths(S, 1);
+  const bgMonths = Core.biguanTime(S).months;
+  const trial = Core.trialStatus(S);
+  const inChildhood = !!(S.mortal && S.childhood && S.childhood.active);
+  const storyChildhood = inChildhood && S.childhood.storyMode;
+  setText('#dur-tuna', storyChildhood ? '一幕' : inChildhood ? '二日' : S.mortal ? '择业' : cnDur(Math.round(r.T * K.tunaMonths * tm)));
+  setText('#dur-biguan', storyChildhood ? '可选' : inChildhood ? '一日' : S.mortal ? '知行路' : cnDur(Math.round(bgMonths)) + (trial && bgMonths > trial.left ? ' · 越期' : ''));
+  setText('[data-act="tuna"] .act-t', storyChildhood ? '续事' : inChildhood ? '读书' : S.mortal ? '生计' : '吐纳');
+  setText('[data-act="biguan"] .act-t', storyChildhood ? '旧事' : inChildhood ? '做活' : S.mortal ? '远行' : '闭关');
+  stackAside($('#margin-when'), timeLabel());
+  const locNow = typeof LOC !== 'undefined' && S.loc && LOC[S.loc] ? LOC[S.loc].name : '山中';
+  const calYear = 3721 + Math.max(0, (S.age|0) - 16);
+  const calSeason = ['春','夏','秋','冬'][season];
+  setText('#journal-title', typeof Calendar !== 'undefined' ? `${Calendar.long(S)} · ${locNow}` : `大衍历${calYear}年 · ${locNow} · ${calSeason}`);
+  const calendarButton = $('#btn-calendar');
+  if (calendarButton) calendarButton.hidden = !(typeof Calendar !== 'undefined' && Calendar.owned(S));
+  setText('#journal-place', '');
+  stackAside($('#margin-where'), locNow);
+  const cnt = Object.values(S.items).reduce((a, b) => a + b, 0);
+  const bagLab = S.eq && S.eq.weapon ? (cnt ? `佩·${cn(cnt)}` : '佩') : (cnt ? `${cn(cnt)}物` : '空');
+  setText('#bag-count', bagLab);
+  if (typeof JHUI !== 'undefined') setText('#youli-sub', JHUI.youliSub());
+  setText('[data-act="youli"] .act-t', S.mortal ? (inChildhood ? '游历' : '人情') : '游历');
+  if (S.mortal && !inChildhood) setText('#youli-sub', '旧友新约');
+  $('#btn-break').hidden = !bottleneck() || S.dead || S.ascended;
+  const st = $('#status-line'); st.classList.remove('zhu');
+  let msg = '';
+  if (bottleneck()) {
+    const pill = r.pill;
+    msg = (S.items[pill] > 0) ? (S.realm === 4 ? '瓶颈已至 · 囊中有符，可渡劫' : '瓶颈已至 · 囊中有丹，可破境') : (S.realm === 4 ? '瓶颈已至 · 可渡劫，坊市或有渡厄符' : '瓶颈已至 · 可破境，坊市或有丹药');
+    st.classList.add('zhu');
+  }
+  else if (S.inj > 0) { msg = `伤势未愈 · 修炼减半`; st.classList.add('zhu'); }
+  else if (S.buff) msg = `灵脉加持 · 余${cn(S.buff.n)}次`;
+  else if (lowLife) { msg = '寿元无多'; st.classList.add('zhu'); }
+  else if (S.xj < 15) { msg = '心境动摇 · 恐生心魔'; st.classList.add('zhu'); }
+  else if (S.court && S.court.rank >= 6 && typeof canClaimThrone === 'function' && (canClaimThrone(S) || canRegent(S)) && !S.flags.jc_throne) { msg = '鼎鼐可问 · 往京城一抉'; st.classList.add('zhu'); }
+  else if (S.karma && (S.karma.seeds || []).some(k => S.months >= k.due && !S.flags['karma_done_' + k.id])) { msg = '因果将至 · 游历或逢回响'; st.classList.add('zhu'); }
+  else if (S.flags && S.flags.tideDue) { msg = '天下有变 · 出山或可遇见'; st.classList.add('zhu'); }
+  else if (!S.mortal && S.flags && S.flags.guide && (S.acts | 0) < 1) msg = '先吐纳一息，或出山看看';
+  else if ((S.flags && S.flags.cultRun | 0) >= 6) { msg = '闭关已久 · 山外或有机缘'; st.classList.add('zhu'); }
+  else if (S.gf && GONGFA[S.gf].mo) msg = `魔功在身 · ${GONGFA[S.gf].name}`;
+  else {
+    const bits = [];
+    if (S.gf && GONGFA[S.gf]) bits.push('主《' + GONGFA[S.gf].name + '》');
+    if ((S.aux || []).length) bits.push('辅' + cn(S.aux.length));
+    if (S.fabao) bits.push('本命' + S.fabao.name);
+    if (S.path && S.path.daoji && typeof DAOJI !== 'undefined' && DAOJI[S.path.daoji]) bits.push(DAOJI[S.path.daoji].name);
+    if (bits.length) msg = bits.slice(0, 3).join(' · ');
+  }
+  st.textContent = msg;
+  renderSide();
+  renderTraces();
+  maybeInjHint();
+  renderSeals();
+}
+function stackAside(el, text) {
+  if (!el) return;
+  const s = text || '';
+  if (el.dataset.raw === s) return;
+  el.dataset.raw = s;
+  el.textContent = '';
+  for (let i = 0; i < s.length; i++) {
+    const n = document.createElement('i');
+    n.textContent = s.charAt(i);
+    el.appendChild(n);
+  }
+}
+function renderSeals() {
+  const col = $('#margin-seals'), note = $('#margin-note');
+  if (!col || !S) return;
+  if (typeof Juan !== 'undefined' && Juan.ensure) Juan.ensure(S);
+  const list = S.colophon || [];
+  const paper = document.querySelector('#scr-main .scroll-paper');
+  const setNote = on => { if (paper) paper.classList.toggle('has-note', !!on); };
+  if (!list.length) {
+    col.hidden = true; col.innerHTML = '';
+    if (note) { note.hidden = true; note.textContent = ''; }
+    delete document.body.dataset.seals;
+    setNote(false);
+    return;
+  }
+  document.body.dataset.seals = '1';
+  const last = list[list.length - 1];
+  const sig = list.length + '|' + (last.seal || '') + '|' + (last.line || '');
+  const changed = !!(renderSeals._sig && renderSeals._sig !== sig);
+  renderSeals._sig = sig;
+  const show = list.slice(-6);
+  col.hidden = false;
+  col.innerHTML = show.map((c, i) => {
+    const label = (typeof Juan !== 'undefined' && Juan.markLabel) ? Juan.markLabel(c) : ((c.seal || '印') + ' · ' + (c.t || ''));
+    const line = (typeof Juan !== 'undefined' && Juan.coloShown) ? Juan.coloShown(c) : (c.line || '');
+    const land = changed && i === show.length - 1 ? ' land' : '';
+    return `<button type="button" class="m-seal${land}" aria-label="${esc(label)}"><span class="m-ch">${esc(c.seal || '印')}</span><span class="m-tip" role="tooltip"><b>${esc(label)}</b><em>${esc(line)}</em></span></button>`;
+  }).join('');
+  if (note) {
+    const line = (typeof Juan !== 'undefined' && Juan.coloShown) ? Juan.coloShown(last) : (last.line || '');
+    note.hidden = !line;
+    note.textContent = line;
+    note.classList.toggle('land', changed && !!line);
+    setNote(!!line);
+  } else setNote(false);
+  syncColo();
+}
+// 宽屏右栏：功法 / 宗门 / 行囊 / 行迹 一览（窄屏隐藏时不渲染）
+const esc = t => String(t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+function renderSide() {
+  const side = $('#side'); if (!side || !side.offsetParent || !S) return;
+  const g = S.gf && GONGFA[S.gf];
+  const auxN = (S.aux || []).length;
+  const pathBits = (Core.pathSummary(S) || []).map(x => x.name).join(' · ');
+  const fabaoLine = S.fabao ? `<span class="sd-row">本命 · ${esc(S.fabao.name)} · ${FABAO_STAGE[S.fabao.stage|0]}</span>` : '';
+  const auxLine = auxN ? `<span class="sd-row">辅修 ${cn(auxN)} 门</span>` : '';
+  const pathLine = pathBits ? `<span class="sd-row path-line">${esc(pathBits)}</span>` : '';
+  $('#sd-gf').innerHTML = g
+    ? `<b class="sd-name">《${esc(g.name)}》</b><span class="sd-row"><em>${GF_GRADE[g.grade]}</em>${S.gfs[S.gf].lv >= GF_LAYERS ? '大成' : '第' + cn(S.gfs[S.gf].lv) + '层'} · 行功×${Core.gfSpeed(S).toFixed(2)}</span>${auxLine}${fabaoLine}${pathLine}`
+    : (fabaoLine || pathLine ? `${fabaoLine}${pathLine}` : `<span class="sd-empty">${S.mortal ? '村中有书与手艺，心中尚无仙法' : '胸中尚无功法'}</span>`);
+  const o = Core.org(S);
+  const bond = [];
+  if (S.bond && S.bond.lost && S.karma && S.karma.mate) bond.push('道侣已失');
+  else if (S.karma && S.karma.mate && typeof NPCS !== 'undefined' && NPCS[S.karma.mate]) bond.push('道侣 · ' + NPCS[S.karma.mate].name);
+  const discs = (S.bond && S.bond.discs) || [];
+  if (discs.length) bond.push('徒 · ' + discs.map(d => d.name + (d.fate === 'betray' ? '·叛' : d.fate === 'inherit' ? '·承' : d.fate === 'surpass' ? '·青' : '')).join('、'));
+  if (S.karma && S.karma.foe && typeof NPCS !== 'undefined' && NPCS[S.karma.foe]) bond.push('宿敌 · ' + NPCS[S.karma.foe].name);
+  const bondLine = bond.length ? `<span class="sd-row">${esc(bond.join(' · '))}</span>` : '';
+  $('#sd-sect').innerHTML = o ? `<b class="sd-name">${esc(o.name)}</b><span class="sd-row">${esc(Core.rankName(S))} · 贡献 ${fmtNum(S.sect.gx)}</span>${bondLine}`
+    : `<b class="sd-name">${esc(S.mortal ? '青石村' : Core.rankName(S))}</b><span class="sd-row">${S.mortal ? '人间生活 · 尚未入道' : '无门无派，来去自由'}</span>${bondLine}`;
+  const items = Object.entries(S.items).filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1]);
+  const eqLine = S.eq && S.eq.weapon ? `<span class="sd-row">佩 · ${esc(S.eq.weapon)}</span>` : '';
+  $('#sd-bag').innerHTML = (eqLine || items.length) ? `${eqLine}${items.length ? `<ul class="sd-list">${items.slice(0, 4).map(([k, n]) => `<li><span>${esc(k)}</span><i>${cn(n)}</i></li>`).join('')}</ul>` : ''}${items.length > 4 ? `<span class="sd-more">另有${cn(items.length - 4)}种</span>` : ''}`
+    : '<span class="sd-empty">行囊空空</span>';
+  const loc = typeof LOCS !== 'undefined' && LOCS.find(l => l.id === S.loc);
+  const notes = [];
+  if (S.court && S.court.rank >= 0) notes.push(`朝 · ${courtRankName(S)}　兵${cn(S.court.bing)} 民${cn(S.court.min)} 道${cn(S.court.dao)}`);
+  if (typeof Folio !== 'undefined' && Folio.keqOn(S)) notes.push(`凡间 · ${Folio.keqTitle(S)}`);
+  if (S.dan && !S.mortal) notes.push(`丹道 ${cn(S.dan.lv)}重`);
+  if (typeof JHUI !== 'undefined' && JHUI.aucWindow()) notes.push('<span class="zhu">听雨楼拍卖将开</span>');
+  if (typeof Jianghu !== 'undefined' && Jianghu.mjOpenList) {
+    const open = Jianghu.mjOpenList(S);
+    if (open.length) notes.push(`<span class="zhu">秘境未闭 · ${open.map(o => esc(o.name) + (o.left ? '·约' + cnDur(o.left) : '')).join('、')}</span>`);
+  }
+  const traces = typeof karmaTraces === 'function' ? karmaTraces(S) : [];
+  const trace = traces.length ? `<ul class="sd-trace">${traces.map(t => `<li><em>${esc(t.st)}</em>${esc(t.name)}${t.hint ? ' · ' + esc(t.hint) : ''}</li>`).join('')}</ul>` : '';
+  $('#sd-loc').innerHTML = `<b class="sd-name">${loc ? esc(loc.name) : '山中'}</b><span class="sd-row">${notes.join('<br>') || '暂无风声'}</span>${trace}`;
+}
+function traceSummary(rows, openN, sealN) {
+  const n = { '将至': 0, '伏笔': 0, '已了': 0, '已消': 0 };
+  rows.forEach(t => { if (n[t.st] != null) n[t.st]++; });
+  const bits = ['将至', '伏笔', '已消', '已了'].filter(k => n[k]).map(k => k + n[k]);
+  if (!bits.length && openN) bits.push('秘境未闭');
+  if (!bits.length && sealN) bits.push('印记' + sealN);
+  return bits.length ? '行迹 · ' + bits.join(' · ') : '';
+}
+function renderTraces() {
+  const el = $('#trace-note'); if (!el || !S) return;
+  const rows = typeof karmaTraces === 'function' ? karmaTraces(S) : [];
+  const open = (typeof Jianghu !== 'undefined' && Jianghu.mjOpenList) ? Jianghu.mjOpenList(S) : [];
+  const seals = (S.colophon || []).slice(-6);
+  const sum = traceSummary(rows, open.length, seals.length);
+  if (!sum) { el.hidden = true; el.classList.remove('on'); el.innerHTML = ''; return; }
+  el.hidden = false; el.classList.add('on');
+  el.innerHTML = `<button type="button" class="trace-sum" id="trace-open" aria-haspopup="dialog">${esc(sum)}</button>`;
+}
+function openTraceSheet() {
+  if (!S) return;
+  const rows = typeof karmaTraces === 'function' ? karmaTraces(S, 0) : [];
+  const open = (typeof Jianghu !== 'undefined' && Jianghu.mjOpenList) ? Jianghu.mjOpenList(S) : [];
+  const seals = (S.colophon || []).slice(-6);
+  const marks = seals.map(c => {
+    const label = (typeof Juan !== 'undefined' && Juan.markLabel) ? Juan.markLabel(c) : ((c.seal || '印') + ' · ' + (c.t || ''));
+    const line = (typeof Juan !== 'undefined' && Juan.coloShown) ? Juan.coloShown(c) : (c.line || '');
+    return `<li><button type="button" class="mark-row" aria-expanded="false"><i>${esc(c.seal || '印')}</i><span>${esc(label)}</span></button><p class="mark-colo" hidden>${esc(line)}</p></li>`;
+  }).join('');
+  const list = rows.length ? `<ul class="sd-trace">${rows.map(t => `<li><em>${esc(t.st)}</em>${esc(t.name)}${t.hint ? ' · ' + esc(t.hint) : ''}${t.detail ? '<p>' + esc(t.detail) + '</p>' : ''}</li>`).join('')}</ul>` : '';
+  const mj = open.length ? `<div class="sd-row zhu">秘境未闭 · ${open.map(o => esc(o.name) + (o.left ? '·约' + cnDur(o.left) : '')).join('、')}</div>` : '';
+  const wrap = document.createElement('div');
+  wrap.className = 'trace-sheet';
+  wrap.innerHTML = `${marks ? `<section class="trace-sec"><h4>此生印记</h4><ul class="mark-list">${marks}</ul></section>` : ''}<section class="trace-sec"><h4>行迹</h4>${list || '<p class="sd-empty">尚无未了的因果</p>'}${mj}</section>`;
+  wrap.addEventListener('click', e => {
+    const btn = e.target.closest('.mark-row');
+    if (!btn || !wrap.contains(btn)) return;
+    const was = btn.getAttribute('aria-expanded') === 'true';
+    wrap.querySelectorAll('.mark-row').forEach(b => {
+      b.setAttribute('aria-expanded', 'false');
+      const p = b.nextElementSibling;
+      if (p && p.classList.contains('mark-colo')) p.hidden = true;
+    });
+    if (!was) {
+      btn.setAttribute('aria-expanded', 'true');
+      const p = btn.nextElementSibling;
+      if (p && p.classList.contains('mark-colo')) p.hidden = false;
+    }
+  });
+  openSheet('行迹', wrap).then(() => {
+    const x = $('#sheet-x');
+    if (x) x.hidden = false;
+  });
+}
+function maybeInjHint() {
+  if (!S || S.dead || !(S.inj > 0)) return;
+  S.flags = S.flags || {};
+  if (S.flags.injTold) return;
+  S.flags.injTold = 1;
+  pushLog({ title: '伤势', text: '这是你第一次负伤。伤未愈时，吐纳与闭关都要减半。宗门俸禄里偶尔有丹；坊市可买回春丹；买来之后，打开行囊服下，伤才会好。', cls: 'warn' });
+}
+
+const LESSONS = [
+  { char: '山', strokes: ['竖', '竖折', '竖'], hint: '先中间，再两边。' },
+  { char: '水', strokes: ['竖钩', '横撇', '撇', '捺'], hint: '先中间，再左，再右。' },
+  { char: '人', strokes: ['撇', '捺'], hint: '一撇一捺，相互撑住。' },
+  { char: '木', strokes: ['横', '竖', '撇', '捺'], hint: '横竖之后，撇捺展开。' }
+];
+function openChildhoodFarewell() {
+  const scene=ChildhoodStory.current(S),wrap=document.createElement('div');wrap.className='mortal-life childhood-farewell';
+  const p=document.createElement('p');p.textContent=scene.text;wrap.appendChild(p);
+  const list=document.createElement('div');list.className='mortal-actions';wrap.appendChild(list);
+  Childhood.choices(S).forEach(choice=>{
+    const b=adultButton(list,choice.name,async()=>{if(choice.id==='sect'){await closeSheet();finishChildhood('sect');}else if(choice.id==='self'){await closeSheet();finishChildhood('self');}else{await closeSheet();finishChildhood(choice.id);}},!choice.enabled,choice.id==='self'?'需要先获得吐纳残篇':choice.id==='sect'?'需要至少两条仙缘线索':'进入成年人间卷');
+    if(choice.id==='stay'||choice.id==='travel')b.classList.add('childhood-primary');
+  });
+  openSheet(scene.title,wrap);
+}
+function openNextChildhood() {
+  if(!S||!S.mortal||!S.childhood||!S.childhood.active||!S.childhood.storyMode)return false;
+  const scene=ChildhoodStory.current(S);
+  if(scene.id==='calendar'){
+    openEvent({id:'childhood_story_calendar',title:scene.title,seal:'历',text:()=>scene.text,choices:()=>[{label:'接下皇历',sub:'获得后可翻月、择日与回看旧事',act:state=>{const out=ChildhoodStory.grantCalendar(state);if(!out.err)out.after=()=>setTimeout(openCalendar,180);return out;}}]});
+    return true;
+  }
+  if(scene.id==='lesson')return openFirstLesson();
+  if(scene.id==='farewell'){openChildhoodFarewell();return true;}
+  const ev=ChildhoodStory.event(S);if(ev)openEvent(ev);return!!ev;
+}
+function openFirstLesson() {
+  if (!S || S.flags.firstLessonDone) return false;
+  const lesson = LESSONS[(S.name.charCodeAt(0) || 0) % LESSONS.length];
+  const wrap = document.createElement('div'); wrap.className = 'first-lesson';
+  let index = 0, mistake = false;
+  const draw = () => {
+    wrap.innerHTML = '';
+    const p = document.createElement('p'); p.textContent = `先生先教你写一个「${lesson.char}」字。${lesson.hint}${mistake ? '刚才那一笔还不在这里，再看一看笔势。' : '按笔顺点下去，写错也可以再试。'}`; wrap.appendChild(p);
+    const glyph = document.createElement('div'); glyph.className = 'lesson-glyph'; glyph.textContent = lesson.char; wrap.appendChild(glyph);
+    const progress = document.createElement('p'); progress.className = 'lesson-progress'; progress.textContent = `已写 ${index} / ${lesson.strokes.length} 笔`; wrap.appendChild(progress);
+    lesson.strokes.forEach((stroke, i) => {
+      const b = document.createElement('button'); b.type = 'button'; b.textContent = stroke;
+      b.onclick = () => {
+        mistake = i !== index;
+        if (!mistake) {
+          index++;
+          if (index >= lesson.strokes.length) {
+            S.flags.firstLessonDone = 1;
+            const out = Childhood.act(S, 'study');
+            const passage=S.childhood.storyMode?ChildhoodStory.finishLesson(S):null;
+            pushLog({ title: '村塾第一课', text: `先生带你写完「${lesson.char}」字。${lesson.hint}你照着写了几遍，终于不再把笔顺弄乱。${passage&&!passage.err?' '+passage.text:''}`, tags: out.tags.concat(passage&&!passage.err?passage.tags:[]) });
+            save(); render(); closeSheet(); return;
+          }
+        }
+        draw();
+      };
+      wrap.appendChild(b);
+    });
+  };
+  draw(); openSheet('村塾第一课', wrap);
+  return true;
+}
+function openFirstErrand() {
+  if (!S || S.flags.firstErrandDone) return false;
+  const wrap = document.createElement('div'); wrap.className = 'first-errand';
+  const steps = [
+    ['先把米袋扎好', '母亲把米袋推到你面前。先检查一下袋口，路上才不会撒。'],
+    ['沿老树下送到邻屋', '你抱着米袋沿老树下走了一趟。邻屋接过米，连声道谢。'],
+    ['回家报一声平安', '你回到家，把邻屋的回话带到。母亲笑了一下，把晚饭往灶边挪近了些。']
+  ];
+  let index = 0;
+  const draw = () => {
+    wrap.innerHTML = '';
+    const p = document.createElement('p'); p.textContent = steps[index][1]; wrap.appendChild(p);
+    const b = document.createElement('button'); b.type = 'button'; b.textContent = steps[index][0]; wrap.appendChild(b);
+    b.onclick = () => {
+      b.disabled = true;
+      index++;
+      if (index >= steps.length) {
+        S.flags.firstErrandDone = 1;
+        const out = Childhood.act(S, 'farm');
+        pushLog({ title: '第一次帮工', text: '你把米送到邻屋，又记得回家报平安。母亲知道，你已经能替家里做一件完整的小事。', tags: out.tags });
+        save(); render(); closeSheet(); return;
+      }
+      draw();
+    };
+  };
+  draw(); openSheet('家中差事', wrap);
+  return true;
+}
+function settleChildhoodGather(place) {
+  const season = Math.floor((S.months % 12) / 3);
+  const out = Childhood.act(S, 'gather');
+  if (out.err) { toast(out.err); return; }
+  const item = place.items[season];
+  S.items[item] = (S.items[item] || 0) + 1;
+  if (item === '旧纸') S.childhood.clues += 0.5;
+  const found = item === '青叶草' ? '一把青叶草' : `青叶草与${item}`;
+  pushLog({ title: `村野 · ${place.name}`, text: `${place.text} 你带回${found}，也记住了这条路什么时候适合走。`, tags: out.tags });
+  save(); render(); checkEnd();
+}
+function openTownPlace(place) {
+  const ev=Town.eventFor(S,place.id);if(ev)openEvent(ev);
+}
+function openChildhoodGather() {
+  return VillageMap.open(S, settleChildhoodGather, openTownPlace, S.adult&&S.adult.started?()=>JHUI.openMap():null);
+}
+function adultButton(parent, name, fn, disabled, hint) {
+  const b = document.createElement('button'); b.type = 'button'; b.textContent = name; b.disabled = !!disabled;
+  if (hint) b.title = hint;
+  b.onclick = fn; parent.appendChild(b); return b;
+}
+function openAdultLife() {
+  const wrap = document.createElement('div'); wrap.className = 'mortal-life adult-life';
+  let settling = false;
+  const summary = document.createElement('p'); wrap.appendChild(summary);
+  const run = (fn, redraw) => {
+    if (settling) return; settling = true;
+    const out = fn();
+    if (!out || out.err) { toast(out && out.err || '此刻还不能做这件事'); settling = false; return; }
+    pushLog({ title: out.title, text: out.text, tags: out.tags, cls: 'event' });
+    save(); render(); checkEnd();
+    const pendingEvent = !S.dead && out.event && EVENTS.find(e => e.id === out.event);
+    if (pendingEvent) {
+      settling = false;
+      closeSheet().then(() => openEvent(pendingEvent));
+      return;
+    }
+    if (!S.dead && redraw) redraw();
+    setTimeout(() => { settling = false; }, snappy() ? 60 : 350);
+  };
+  const section = (title) => {
+    const sec = document.createElement('section'); sec.className = 'adult-section';
+    const h = document.createElement('h3'); h.textContent = title; sec.appendChild(h);
+    const list = document.createElement('div'); list.className = 'mortal-actions'; sec.appendChild(list); wrap.appendChild(sec); return list;
+  };
+  const draw = () => {
+    const a = Adulthood.ensure(S), c = Adulthood.CAREERS.find(x => x.id === a.career);
+    summary.textContent = `${Calendar.long(S)} · ${c ? c.name : '尚未择业'} · 已做${a.work}段生计。成年以后，先过日子，再决定要向哪里走。`;
+    wrap.querySelectorAll('.adult-section').forEach(el => el.remove());
+    let list = section('眼下生计');
+    Adulthood.CAREERS.forEach(career => {
+      adultButton(list, career.name + (a.career === career.id ? ' · 眼下正做' : ' · 二日'), () => run(() => Adulthood.chooseCareer(S, career.id), draw), a.career === career.id, '改换生计不会抹去已有技艺');
+    });
+    if (c) {
+      adultButton(list, `${c.name} · 做三日`, () => run(() => Adulthood.work(S), draw));
+      adultButton(list, `${c.name} · 安心做一年`, () => run(() => Adulthood.workYear(S), draw), false, '逐次结算原工作 121 次，人物、约定与寿元继续推进');
+    }
+    adultButton(list, '回家歇息备粮 · 一日', () => { if (settling) return; mortalRest(); draw(); });
+    list = section('路与见闻');
+    Adulthood.discoveries(S).forEach(road => {
+      adultButton(list, road.name + (road.done ? ' · 已识此路' : ` · ${road.days}日`), () => run(road.run, draw), road.done || !road.enabled, road.done ? '地图已有此处' : road.enabled ? '真实消耗日期并添入地图' : '需要先知道前一段路，或再多读些书');
+    });
+    list = section('仙缘消息');
+    Adulthood.immortalOptions(S).forEach(choice => {
+      adultButton(list, choice.name, async () => {
+        if (settling || !choice.enabled) return;
+        await closeSheet();
+        if (choice.id === 'sect') finishChildhood('sect');
+        else enterCultivation(choice.id === 'insight' ? 'insight' : 'self', null);
+      }, !choice.enabled, choice.hint);
+    });
+  };
+  const growthLink = adultButton(wrap, '成长底账 · 当前与往昔', () => openSheet('成长', growthPage())); growthLink.className = 'path-wash-btn growth-link';
+  draw(); openSheet('成年 · 人间生计', wrap);
+}
+function adultContactsView() {
+  const w = document.createElement('div'); w.className = 'npcs adult-contacts';
+  const project = S.adult.projects.school;
+  Adulthood.contacts(S).forEach(row => {
+    const c = document.createElement('div'); c.className = 'npc';
+    const seal = document.createElement('span'); seal.className = 'npc-seal'; seal.textContent = row.c.seal; c.appendChild(seal);
+    const info = document.createElement('div'); info.className = 'npc-info';
+    const name = document.createElement('div'); name.className = 'npc-name'; name.textContent = row.c.name;
+    const relation = document.createElement('em'); relation.textContent = row.relation; name.appendChild(relation); info.appendChild(name);
+    const title = document.createElement('div'); title.className = 'npc-title'; title.textContent = `${row.c.title} · ${row.state}`; info.appendChild(title);
+    const goal = document.createElement('p'); goal.className = 'npc-line'; goal.textContent = row.alive ? row.goal : '旧言仍在，故人的日子已经走到尽头。'; info.appendChild(goal);
+    if (row.promise) {
+      const due = document.createElement('p'); due.className = 'loop-note';
+      const remaining = Math.max(0, row.promise.due - Calendar.absolute(S));
+      due.textContent = row.promise.cal ? `${row.promise.cal.year}年${Calendar.monthName(row.promise.cal.month)}${Calendar.dayName(row.promise.cal.day)} · 青石村` : `青石村之约 · 还余${cn(remaining)}日`;
+      info.appendChild(due);
+    }
+    const actions = document.createElement('div'); actions.className = 'loop-actions';
+    const run = kind => {
+      const out = Adulthood.interact(S, row.c.id, kind);
+      if (out.err) { toast(out.err); return; }
+      pushLog({ title: out.title, text: out.text, tags: out.tags, cls: 'event' }); save(); render(); checkEnd();
+      if (!S.dead) w.replaceWith(adultContactsView());
+    };
+    adultButton(actions, '叙话 · 一日', () => run('talk'), !row.alive || !row.present, row.present ? '当面说话' : '须去对方所在之处');
+    if ((row.c.id === 'village_teacher' || row.c.id === 'village_craftsman') && project && project.stage === 0 && !project.introduced)
+      adultButton(actions, '引荐修缮 · 一日', () => run('introduce'), !row.alive || !row.present, '让先生与匠人认识，而非替他们决定');
+    if (row.c.id === 'village_craftsman' && project && project.stage === 0 && !project.materials)
+      adultButton(actions, '托付木料 · 二日', () => run('materials'), !row.alive || !row.present, '一份枯枝，或三灵石');
+    if (row.c.id === 'village_friend' && !S.adult.projects.letter)
+      adultButton(actions, '替阿禾捎话 · 二日', () => run('letter'), !row.alive || !row.present, '捎到镇上，也认识渡口的路');
+    if (row.promise) adultButton(actions, '赴约 · 一日', () => run('visit'), !row.alive || !row.present, '约定日期前后十五日内可赴约');
+    else adultButton(actions, '相约一月后', () => run('promise'), !row.alive || !row.present, '日期会写入成年卷');
+    info.appendChild(actions); c.appendChild(info); w.appendChild(c);
+  });
+  return w;
+}
+function openAdultContacts() {
+  if (!S || !S.adult || !S.adult.started) return openMortalLife();
+  openSheet('人情 · 各自的日子', adultContactsView());
+}
+function openMortalLife() {
+  if (S && S.adult && S.adult.started) return openAdultLife();
+  if (!S || !S.mortal || !S.childhood) return;
+  const wrap = document.createElement('div'); wrap.className = 'mortal-life';
+  const summary = document.createElement('p');
+  const list = document.createElement('div'); list.className = 'mortal-actions';
+  wrap.appendChild(summary); wrap.appendChild(list);
+  let settling = false;
+  const draw = () => {
+    const c = S.childhood;
+    summary.textContent = c.storyMode ? `这里都是可选旧事，不做也不会挡住下一幕。识字${Math.floor(c.skills.read)} · 手艺${Math.floor(c.skills.craft)} · 采集${Math.floor(c.skills.gather)} · 仙缘线索${Math.floor(c.clues)}。${Calendar.owned(S)?'皇历已在行囊，可翻月择日。':''}` : `识字${Math.floor(c.skills.read)} · 手艺${Math.floor(c.skills.craft)} · 采集${Math.floor(c.skills.gather)} · 仙缘线索${Math.floor(c.clues)}。${Calendar.owned(S) ? '皇历已得，可翻月择日。' : S.flags.calendarHint ? '先生等你十二岁来换历。' : '线索会在寻访中累积，不会永远无门。'}`;
+    list.innerHTML = '';
+    if(c.storyMode&&S.childhood.active){
+      const next=document.createElement('button');next.type='button';next.textContent='继续 · '+ChildhoodStory.current(S).title;next.className='childhood-primary';next.onclick=async()=>{await closeSheet();openNextChildhood();};list.appendChild(next);
+    }
+    Childhood.available(S).forEach(action => {
+      const b = document.createElement('button'); b.type = 'button'; b.textContent = `${action.name} · ${action.days}日`;
+      b.onclick = async () => {
+        if (settling) return;
+        settling = true;
+        const out = Childhood.act(S, action.id); if (out.err) { settling = false; toast(out.err); return; }
+        pushLog({ title: '凡间记事', text: out.text, tags: out.tags }); save(); render();
+        if (action.id === 'calendar') { await closeSheet(); openCalendar(); return; }
+        if (S.dead) { closeSheet(); checkEnd(); return; }
+        draw();
+        setTimeout(() => { settling = false; }, snappy() ? 60 : 350);
+      };
+      list.appendChild(b);
+    });
+    if(!c.storyMode)[['study', '读书温习一季'], ['farm', '帮家中做活一季'], ['seek', '寻访仙缘一季']].forEach(([id, label]) => {
+      if (!Childhood.available(S).some(a => a.id === id) || (id === 'study' && !S.flags.firstLessonDone) || (id === 'farm' && !S.flags.firstErrandDone)) return;
+      const b = document.createElement('button'); b.type = 'button'; b.textContent = label;
+      b.title = '逐次结算这一季，不跳过中途的成长与变化';
+      b.onclick = () => {
+        if (settling) return;
+        settling = true;
+        const out = Childhood.season(S, id); if (out.err) { settling = false; toast(out.err); return; }
+        pushLog({ title: out.title, text: out.text, tags: out.tags }); save(); render();
+        if (S.dead) { closeSheet(); checkEnd(); return; }
+        draw(); setTimeout(() => { settling = false; }, snappy() ? 60 : 350);
+      };
+      list.appendChild(b);
+    });
+    if(!c.storyMode)Childhood.choices(S).filter(c => S.childhood.active && (c.id === 'stay' || c.id === 'travel')).forEach(choice => {
+      const b = document.createElement('button'); b.type = 'button'; b.textContent = choice.name; b.disabled = !choice.enabled;
+      b.title = '结束童年，进入成年人间卷';
+      b.onclick = async () => { await closeSheet(); finishChildhood(choice.id); };
+      list.appendChild(b);
+    });
+  };
+  const growthLink = adultButton(wrap, '成长底账 · 当前与往昔', () => openSheet('成长', growthPage())); growthLink.className = 'path-wash-btn growth-link';
+  draw(); openSheet('村中生计与仙缘', wrap);
+}
+function childhoodAction(id) {
+  if (id === 'study' && openFirstLesson()) return;
+  if (id === 'farm' && openFirstErrand()) return;
+  lock(snappy() ? 60 : 450);
+  const out = Childhood.act(S, id);
+  if (out.err) { toast(out.err); return; }
+  pushLog({ title: '童年记事', text: out.text, tags: out.tags });
+  render(); save(); checkEnd();
+  if (!S.dead && S.age >= 16 && S.childhood.active) setTimeout(openMortalLife, snappy() ? 60 : 350);
+}
+function mortalRest() {
+  lock(snappy() ? 40 : 450);
+  Core.passDays(S, 1, pushLog);
+  S.xj = Math.min(100, S.xj + 2);
+  const foodAdd = Math.min(4, 10 - (S.items['干粮'] || 0));
+  S.items['干粮'] = (S.items['干粮'] || 0) + foodAdd;
+  pushLog({ title: '歇息备粮', text: `今日没有赶路。你把屋里收拾好，${foodAdd ? `家中替你包了${cn(foodAdd)}份干粮。` : '家中的干粮已经备足。'}早睡一觉，醒来时心神安稳。`, cls: 'breath' });
+  render(); save(); checkEnd();
+}
+
+/* ================= 行动 ================= */
+let busy = false;
+function lock(ms) { busy = true; $$('.act').forEach(b => b.classList.add('busy')); setTimeout(() => { busy = false; $$('.act').forEach(b => b.classList.remove('busy')); }, ms); }
+function act(kind) {
+  if (busy || !S || S.dead || S.ascended) return;
+  if (kind === 'bag') return openBag();
+  const inChildhood = S.mortal && S.childhood && S.childhood.active;
+  if (inChildhood && S.childhood.storyMode && kind === 'tuna') return openNextChildhood();
+  if (inChildhood && kind === 'tuna') return childhoodAction('study');
+  if (inChildhood && S.childhood.storyMode && kind === 'biguan') return openMortalLife();
+  if (inChildhood && kind === 'biguan') { if (openFirstErrand()) return; return openMortalLife(); }
+  if (inChildhood && kind === 'youli') return openChildhoodGather();
+  if (S.mortal && kind === 'tuna') return openMortalLife();
+  if (S.mortal && kind === 'biguan' && typeof JHUI !== 'undefined') return S.loc==='qingshi'?openChildhoodGather():JHUI.openMap();
+  if (S.mortal && kind === 'youli') return openAdultContacts();
+  const r = R();
+  if (kind === 'tuna') {
+    S.flags.cultRun = (S.flags.cultRun | 0) + 1;
+    if (typeof MoAudio !== 'undefined') MoAudio.play('breath');
+    lock(1500);
+    const B = buffer(), o = Core.tuna(S, B.emit);
+    save();
+    // 灵气旋入丹田之后，才落笔记下这一季
+    const done = async () => {
+      if (!S) return;
+      pushLog({ text: o.text, tags: o.tags }); B.flush(); Core.afterGain(S, o.ups, pushLog);
+      if (typeof Life !== 'undefined' && Life.takeVignette) {
+        const v = Life.takeVignette(S, 'tuna');
+        if (v) pushLog({ title: v.title, text: v.text, cls: 'breath' });
+      }
+      render(); save(); checkEnd(); maybeWanderNudge(); maybeGuide();
+      const bx = $('.bar-xw'); bx.classList.remove('gain'); void bx.offsetWidth; bx.classList.add('gain');
+      clearTimeout(act.gt); act.gt = setTimeout(() => bx.classList.remove('gain'), 1500);
+      await maybeFabaoCeremony();
+    };
+    if (typeof InkGL !== 'undefined' && InkGL.qi) InkGL.qi($('.scroll-paper'), { cy: .5, onSink: done });
+    else { const sp = $('.scroll-paper').getBoundingClientRect(); FX.qiSwirl(sp.left + sp.width / 2, sp.top + sp.height * 0.55, done); }
+    return;
+  }   else if (kind === 'biguan') {
+    S.flags.cultRun = (S.flags.cultRun | 0) + 1;
+    if (typeof Jianghu !== 'undefined' && Jianghu.mjLapseWarn) {
+      const span = Core.biguanTime(S).months;
+      const warn = Jianghu.mjLapseWarn(S, span);
+      if (warn) pushLog({ title: '秘境将阖', text: warn, cls: 'warn' });
+    }
+    if (typeof MoAudio !== 'undefined') MoAudio.play('cave');
+    lock(1100);
+    FX.cave();
+    const B = buffer(), o = Core.biguan(S, B.emit);
+    pushLog({ text: o.text, tags: o.tags, cls: o.cls }); B.flush();
+    Core.afterGain(S, o.ups, pushLog);
+    if (typeof Life !== 'undefined') {
+      const v = Life.takeVignette(S, 'biguan');
+      if (v) pushLog({ title: v.title, text: v.text, cls: 'breath' });
+      if (Life.shouldAskGoal(S) && !uiBlocked()) setTimeout(() => openEvent(Life.goalShiftEvent(S)), 500);
+    }
+    render(); save(); checkEnd(); maybeWanderNudge(); maybeGuide();
+    maybeFabaoCeremony();
+    return;
+  } else if (kind === 'youli' && typeof JHUI !== 'undefined') {
+    if (S.flags) S.flags.cultRun = 0;
+    return JHUI.openMap();
+  } else if (kind === 'youli') {
+    if (S.flags) S.flags.cultRun = 0;
+    const ym = Math.max(1, Math.round(r.T * K.youliMonths / (Core.pathYouliMul ? Core.pathYouliMul(S) : 1)));
+    Core.passTime(S, ym, pushLog);
+    if (S.dead) { render(); save(); checkEnd(); return; }
+    const ev = Core.pickEvent(S);
+    render(); save();
+    busy = true; $$('.act').forEach(b => b.classList.add('busy'));
+    // 先把卷上的字推上去，空出卷底的远山，山路只画在空白处
+    const log = $('#log'), paperR = $('.scroll-paper').getBoundingClientRect();
+    const spacer = document.createElement('div'); spacer.className = 'log-spacer'; spacer.style.height = Math.round(paperR.height * 0.44) + 'px';
+    log.appendChild(spacer); log.scrollTo({ top: log.scrollHeight, behavior: FX.reduced() ? 'auto' : 'smooth' });
+    sleep(FX.reduced() ? 0 : 520).then(() => FX.inkPath(paperR)).then(() => {
+      busy = false; $$('.act').forEach(b => b.classList.remove('busy'));
+      openEvent(ev);
+      setTimeout(() => spacer.remove(), 900);
+    });
+    return;
+  }
+  render(); save(); checkEnd();
+}
+const GUIDES = [
+  { id: 'g1', min: 0, title: '晨课', seal: '息',
+    text: '入山第一夜，窗纸被风吹得轻轻响。执事只叮过一句：吐纳，是一季的呼吸；闭关，是一年的灯火。修为走到头时，卷上会浮出一枚朱红的「破境」。',
+    ok: '先去吐纳', okText: '你吸了一口气。丹田里有一点暖，像一粒还没点燃的火星。' },
+  { id: 'g2', min: 2, title: '旧囊', seal: '囊',
+    text: '你摸到袖中那只旧囊。丹药、残卷、兵器，都收在底下那枚「行囊」里——服下，佩上，或只是看看。有些东西不到时候，吃了也无益。',
+    ok: '记下了', okText: '你把囊口系紧。东西还在，路也还在。' },
+  { id: 'g3', min: 4, title: '腰间印', seal: '修',
+    text: '腰侧那枚黑印，刻着一个「修」字。点开它，便是功法、本命与日后的定型。主修一门，辅修至多两门。路还长，不必今夜都懂。',
+    ok: '知道了', okText: '你按了按那枚印。它凉，像一块刚落定的墨。' },
+];
+function guideBody(g) {
+  if (!g || g.id !== 'g1' || !S) return g ? g.text : '';
+  const late = (S.acts | 0) > 0 || (S.age | 0) > 16 || (S.months | 0) > 16 * 12;
+  if (!late) return g.text;
+  return '这课来得晚了些。你已经在山里走动过。吐纳，是一季的呼吸；闭关，是一年的灯火。修为走到头时，卷上会浮出一枚朱红的「破境」。';
+}
+function guideEvent(g) {
+  return {
+    id: g.id, guide: true, title: g.title, seal: g.seal,
+    text: () => guideBody(g),
+    choices: () => [
+      { label: g.ok, sub: '', act: () => ({ text: g.okText, fx: { xj: 1 } }) },
+      { label: '这些我已知', sub: '不再提示', skipAll: true, act: () => ({ text: '你拱了拱手。后头没说完的话，山风替你吹散了。', fx: {} }) },
+    ],
+  };
+}
+function uiBlocked() {
+  if (busy) return true;
+  if (document.querySelector('.ask')) return true;
+  for (const id of ['end', 'rite', 'dan', 'auc', 'duel', 'bt', 'path-cer', 'baishan', 'goal-cer', 'modal', 'sheet', 'mj', 'map', 'scroll-view']) {
+    const el = document.getElementById(id);
+    if (el && !el.hidden) return true;
+  }
+  return false;
+}
+function finishGuide() {
+  if (S && S.flags) S.flags.guide = 0;
+  if (typeof Samsara === 'undefined') return;
+  const m = Samsara.loadMeta();
+  m.guide = 1;
+  Samsara.saveMeta(m);
+}
+function maybeGuide(fromRetry) {
+  if (S && S.mortal && S.flags) S.flags.guide = 0;
+  if (!S || S.dead || S.ascended || !S.flags || !S.flags.guide || S.flags.trial) return;
+  if (!fromRetry) { maybeGuide._gen = (maybeGuide._gen | 0) + 1; maybeGuide._n = 0; }
+  const gen = maybeGuide._gen | 0;
+  if (uiBlocked()) {
+    if ((maybeGuide._n | 0) < 24) {
+      maybeGuide._n = (maybeGuide._n | 0) + 1;
+      setTimeout(() => { if ((maybeGuide._gen | 0) === gen) maybeGuide(true); }, 500);
+    }
+    return;
+  }
+  maybeGuide._n = 0;
+  const g = GUIDES.find(x => !S.flags[x.id] && (S.acts | 0) >= x.min);
+  if (!g) return;
+  openEvent(guideEvent(g));
+}
+function maybeWanderNudge() {
+  if (!S || !S.flags || S.dead) return;
+  const n = S.flags.cultRun | 0;
+  const key = 'nudgeW' + S.realm;
+  if (n === 8 && !S.flags[key]) {
+    S.flags[key] = 1;
+    pushLog({ text: '你在洞里坐得太久，窗纸都黄了一圈。山门外似有人声，像在喊集市，又像只是风。', cls: 'sys' });
+  }
+}
+let endT = 0;
+function checkEnd() {
+  const trial = Core.trialStatus(S);
+  if (trial && trial.result && !S.flags.trialResult) {
+    S.flags.trialResult = trial.result;
+    S.flags.trialEndReason = S.ending || '';
+    S.dead = true; S.ending = 'trial';
+    pushLog({ title: '试炼终', text: trial.result === 'success' ? '二十载内已至金丹中期，试炼达成。此局收卷，不入轮回簿。' : '试炼收卷，目标未达成。此局不入轮回簿。', cls: 'sys', div: true });
+    save();
+  }
+  if (S && S.dead && !endT) endT = setTimeout(() => { endT = 0; if (S && S.dead) showEnd(S.ending || 'zuohua'); }, 1800);
+  else if (S && !S.dead && S.sect && S.sect.dabiDue) setTimeout(dabiInvite, 1400);
+}
+
+/* ================= 奇遇卷轴 ================= */
+const modal = $('#modal');
+function snappy() {
+  const root = document.documentElement;
+  return root.dataset.motion === 'lite' || root.dataset.fx === 'thin' || (typeof FX !== 'undefined' && FX.reduced());
+}
+async function openModal() {
+  modal.hidden = false;
+  const hs = $('#hscroll');
+  hs.style.setProperty('--half', (hs.offsetWidth / 2 - 10) + 'px');
+  $('.ev-main').scrollTop = 0;
+  await sleep(snappy() ? 16 : 30);
+  modal.classList.add('open');
+}
+async function closeModal() {
+  modal.classList.remove('open');
+  await sleep(snappy() ? 240 : 640);
+  modal.hidden = true;
+}
+function soberFace(ev) {
+  if (!ev) return null;
+  if (ev.id === 'people_tang_market' || ev.id === 'people_lu_hunt' || (ev.id === 'people_bond_tang' && S.flags.tangRuined)) return { mouth: 'flat', brow: 1 };
+  if (ev.id === 'echo_meet' || ev.id === 'echo_hunt' || ev.id === 'bond_part') return { mouth: 'flat', brow: 1 };
+  return null;
+}
+function portraitHtml(ev) {
+  if (typeof InkPortrait === 'undefined' || !ev) return '';
+  const face = soberFace(ev);
+  if (ev.id === 'jc_bing' && S.npc && S.npc.helan && !S.npc.helan.dead) return InkPortrait.svg('helan', face);
+  if ((ev.id === 'bond_dual' || ev.id === 'bond_jie' || ev.id === 'bond_part') && S && S.karma && S.karma.mate) {
+    const svg = InkPortrait.svg(S.karma.mate, face);
+    if (svg) return svg;
+  }
+  if (S && (ev.id === 'echo_meet' || ev.id === 'echo_hunt' || ev.id === 'echo_grace')) {
+    const c = S.flags && S.flags.karmaCarry;
+    const hook = S.echo && S.echo.by;
+    let id = '';
+    if (ev.id === 'echo_meet') id = (c && c.role === 'mate' && c.id) || (hook && hook.mate && hook.mate.id) || '';
+    else if (ev.id === 'echo_hunt') id = (c && c.role === 'foe' && c.id) || (hook && hook.foe && hook.foe.id) || '';
+    else id = (c && c.role === 'en' && c.id) || '';
+    const svg = id ? InkPortrait.svg(id, face) : '';
+    if (svg) return svg;
+  }
+  return InkPortrait.forEvent(ev, face);
+}
+function evTitle(ev) { return ev && typeof ev.title === 'function' ? ev.title(S) : (ev && ev.title) || ''; }
+function choiceSub(c, s) {
+  if (c.odds != null && s && s.evFoe && typeof Core !== 'undefined' && Core.oddsWord) {
+    const base = typeof c.odds === 'function' ? c.odds(s) : c.odds;
+    const w = Core.oddsWord(s, base);
+    if (w) return w;
+  }
+  if (c.toll && s && typeof Core !== 'undefined' && Core.tollText) {
+    const spec = typeof c.toll === 'function' ? c.toll(s) : c.toll;
+    const t = Core.tollText(s, spec);
+    if (t) return t;
+  }
+  return typeof c.sub === 'function' ? c.sub(s) : (c.sub || '');
+}
+function mountFoeSlip(after) {
+  if (!after || !after.parentNode) return;
+  const old = after.parentNode.querySelector('.foe-slip');
+  if (old) old.remove();
+  if (!S || !S.evFoeMeta) return;
+  const meta = S.evFoeMeta;
+  const slip = document.createElement('div');
+  if (meta.roster && meta.roster.length) {
+    slip.className = 'foe-slip roster';
+    slip.innerHTML = meta.roster.map(r => `<div class="foe-row"><b>${esc(r.name)}</b><em>${esc(r.title || '')}</em><span>${esc(r.read || '')}</span><small>${esc(r.realm || '')}</small></div>`).join('');
+  } else if (S.evFoe && Core.glance) {
+    const g = Core.glance(S);
+    slip.className = 'foe-slip' + (g.exact ? '' : ' dim');
+    const title = meta.title ? `<div class="foe-role">${esc(meta.title)}</div>` : '';
+    slip.innerHTML = `<div class="foe-name">${esc(meta.name || '对手')}</div>`
+      + title
+      + (g.exact ? `<div class="foe-realm">${esc(g.realm)}</div>` : '')
+      + `<div class="foe-read">${esc(g.read)}</div>`
+      + (g.exact ? '' : `<div class="foe-rough">${esc(g.rough)}</div>`);
+  } else return;
+  after.insertAdjacentElement('afterend', slip);
+}
+function openEvent(ev) {
+  if (!ev) return;
+  if (!ev.guide && typeof Samsara !== 'undefined' && Samsara.seeEncounter) Samsara.seeEncounter(ev.id);
+  const slot = $('#ev-portrait');
+  if (slot) { const html = portraitHtml(ev); slot.innerHTML = html; slot.hidden = !html; }
+  const title = evTitle(ev);
+  FX.vtext($('#ev-title'), title);
+  $('#ev-seal').textContent = ev.seal || pick(['缘', '遇', '奇', '机']);
+  if (S) { S.evFoe = null; S.evFoeMeta = null; }
+  const text = voice(ev.text(S));
+  $('#ev-result').innerHTML = '';
+  const box = $('#ev-choices'); box.innerHTML = ''; box.className = 'ev-choices';
+  mountFoeSlip($('#ev-text'));
+  openModal();
+  const d = inkWrite($('#ev-text'), text, { immediate: true, step: snappy() ? 6 : 20, cadence: !snappy() });
+  const startAt = (snappy() ? 80 : 420) + d * 0.35;
+  let choices = ev.choices(S);
+  if (typeof Loop !== 'undefined' && Loop.dress) choices = Loop.dress(choices, ev, S);
+  choices.forEach((c, i) => {
+    const b = document.createElement('button'); b.className = 'choice' + (c.odds != null ? ' choice-odds' : ''); b.disabled = !!c.disabled;
+    b._choice = c;
+    b.style.animationDelay = (startAt + i * 120) + 'ms';
+    b.innerHTML = `<span></span><small></small>`; b.firstChild.textContent = c.label; b.lastChild.textContent = choiceSub(c, S);
+    b.onclick = () => {
+      if (c.side && typeof Loop !== 'undefined') return loopSide(c, b, box);
+      choose(ev, c, b, text, title);
+    };
+    box.appendChild(b);
+  });
+}
+function loopSide(c, btn, box) {
+  if (c.side === 'burn') {
+    const r = Loop.burn(S, c.burn);
+    btn.disabled = true; btn.classList.add('picked');
+    toast(r.text || '符烧了。事情按原来的走。');
+    save();
+    return;
+  }
+  if (c.side === 'xian') {
+    const r = Loop.reveal(S);
+    if (r.err) { toast(r.err); return; }
+    btn.disabled = true; btn.classList.add('picked');
+    if (box) box.querySelectorAll('.choice').forEach(b => {
+      if (!b._choice) return;
+      const small = b.querySelector('small');
+      if (small) small.textContent = choiceSub(b._choice, S);
+    });
+    mountFoeSlip($('#ev-text'));
+    toast(r.text);
+    save();
+  }
+}
+function appendManualOffer(out, id, extra) {
+  const o = Core.manualOffer(S, id);
+  if (!o) return;
+  const slip = document.createElement('div'); slip.className = 'manual-slip';
+  const nextLine = o.cap
+    ? '此经已至大成，再读也只是温故。可售予坊市。'
+    : `参悟则至第${cn(o.next)}层，行功 ×${o.nextSpd.toFixed(2)}。`;
+  slip.innerHTML = `<div class="manual-kicker">重复功法 · ${esc(o.role)}</div>
+    <div class="manual-name">《${esc(o.name)}》</div>
+    <div class="manual-now">${esc(o.grade)}品 · 现为第${cn(o.lv)}层 · 行功 ×${o.spd.toFixed(2)}</div>
+    <div class="manual-next"></div>
+    <div class="manual-fade">${o.cap ? '大成之后，只余一桩去处。' : '愈往后，一层比一层淡。不参悟也可收进行囊，日后再定。'}</div>`;
+  slip.querySelector('.manual-next').textContent = nextLine;
+  out.appendChild(slip);
+  const box = document.createElement('div'); box.className = 'ev-choices manual-choices';
+  const done = (btn, r) => {
+    if (r.err) return toast(r.err);
+    if (box.classList.contains('chosen')) return;
+    box.classList.add('chosen'); btn.classList.add('picked');
+    extra.text = r.text;
+    const p = document.createElement('p'); p.className = 'r-text'; p.textContent = r.text;
+    const tg = document.createElement('div'); tg.className = 'entry-tags bleed-in';
+    tg.innerHTML = (r.tags || []).map(x => `<span class="${x.c || ''}">${esc(x.t)}</span>`).join('');
+    out.insertBefore(p, box); out.insertBefore(tg, box);
+    render(); save();
+    const m = $('.ev-main'); if (m) m.scrollTo({ top: m.scrollHeight, behavior: 'smooth' });
+  };
+  const mk = (label, sub, dis, fn) => {
+    const b = document.createElement('button'); b.className = 'choice'; b.disabled = !!dis;
+    b.innerHTML = '<span></span><small></small>';
+    b.firstChild.textContent = label; b.lastChild.textContent = sub;
+    b.onclick = () => { if (box.classList.contains('chosen')) return; fn(b); };
+    box.appendChild(b);
+  };
+  mk('参悟精进', o.cap ? '已至大成' : `升至第${cn(o.next)}层`, o.cap, b => done(b, Core.studyManual(S, id)));
+  mk('售予坊市', `灵石${cn(o.price)}`, false, b => done(b, Core.sellManual(S, id)));
+  out.appendChild(box);
+}
+// 数值标签为空时：正文还在，就不要写成「无事发生」。
+function resultChip(tags, text) {
+  const html = (tags || []).map(x => `<span class="${x.c || ''}">${esc(x.t)}</span>`).join('');
+  if (html) return html;
+  const body = String(text || '').replace(/\s/g, '');
+  return body ? '<span>有所感</span>' : '<span>无事发生</span>';
+}
+function choose(ev, c, btn, evText, titleText) {
+  const box = $('#ev-choices'); if (box.classList.contains('chosen')) return;
+  btn.classList.add('picked'); box.classList.add('chosen');
+  const res = Core.resolveChoice(S, c);
+  const B = buffer(), fxR = Core.applyFx(S, res.fx || {}, B.emit);
+  const tags = [...(res.tags || []), ...(fxR.tags || [])], ups = fxR.ups;
+  if (res.fx && res.fx.gf) FX.goldMotes && setTimeout(() => { const t = $('#ev-result').getBoundingClientRect(); FX.goldMotes(t.left + t.width / 2, t.top + 20); }, 900);
+  const out = $('#ev-result');
+  const p = document.createElement('p'); p.className = 'r-text'; out.appendChild(p);
+  const shown = voice(res.text);
+  const d = inkWrite(p, shown, { immediate: true, step: 20, cadence: true, closeInk: true });
+  const tg = document.createElement('div'); tg.className = 'entry-tags'; tg.style.opacity = 0;
+  tg.innerHTML = res.prelude ? '<span>斗法将起</span>' : resultChip(tags, shown);
+  out.appendChild(tg);
+  const extra = { text: '' };
+  if (fxR.manual) appendManualOffer(out, fxR.manual, extra);
+  const close = document.createElement('button'); close.className = 'brush-btn small'; close.style.opacity = 0;
+  close.innerHTML = '<span class="bb-ink"></span><span class="bb-text">' + (res.prelude ? '入场' : '收卷') + '</span>';
+  out.appendChild(close);
+  let rolled = false;
+  setTimeout(() => { tg.style.opacity = ''; tg.classList.add('bleed-in'); close.style.opacity = ''; close.classList.add('bleed-in');
+    const m = $('.ev-main'); m.scrollTo({ top: m.scrollHeight, behavior: 'smooth' }); }, Math.min(d, 2200) + 200);
+  setTimeout(() => { const m = $('.ev-main'); m.scrollTo({ top: m.scrollHeight, behavior: 'smooth' }); }, 400);
+  close.onclick = async () => {
+    if (rolled) return;
+    rolled = true;
+    await closeModal();
+    if (S.flags) S.flags.cultRun = 0;
+    if (ev.guide) {
+      S.flags[ev.id] = 1;
+      if (c.skipAll) { GUIDES.forEach(g => { S.flags[g.id] = 1; }); finishGuide(); }
+      else if (GUIDES.every(g => S.flags[g.id])) finishGuide();
+    }
+    pushLog({ title: titleText || evTitle(ev), text: `${c.label.replace(/[“”]/g, '')}——${res.text}${extra.text ? ' ' + extra.text : ''}`, tags, cls: ev.xinmo ? 'warn' : 'event', div: true, guide: !!ev.guide });
+    B.flush(); Core.afterGain(S, ups, pushLog);
+    render(); save(); checkEnd();
+    if (!ev.guide) maybeGuide();
+    if (res.after && !S.dead) res.after();
+    if (res.afterBreak && !S.dead && !S.ascended && bottleneck()) setTimeout(() => { if (!uiBlocked()) openBreak(); }, 280);
+  };
+  if (c.skipAll) setTimeout(() => { if (!rolled && close.isConnected) close.click(); }, snappy() ? 40 : 420);
+  if (res.prelude) setTimeout(() => { if (!rolled && close.isConnected) close.click(); }, Math.min(d, 1400) + (snappy() ? 160 : 780));
+  render(); save();
+}
+
+/* ================= 破境 ================= */
+if (typeof BtFx !== 'undefined') BtFx.setWriter((el, text) => inkWrite(el, text, { immediate: true, step: FX.reduced() ? 8 : 55 }));
+
+const btChance = usePill => Core.btChance(S, usePill);
+const chanceWord = p => { const n = Math.round(p * 10); return n <= 1 ? '九死一生' : n >= 9 ? '十拿九稳' : `约莫${cn(n)}成`; };
+function openBreak() {
+  if (!bottleneck() || busy) return;
+  if (typeof Life !== 'undefined' && Life.xinmoPending(S) && !openBreak._skip) {
+    openEvent(Life.xinmoEvent(S));
+    return;
+  }
+  openBreak._skip = false;
+  const r = R(), next = NEXT_REALM_NAME[S.realm], pill = r.pill, has = S.items[pill] > 0, isFu = S.realm === 4;
+  FX.vtext($('#ev-title'), S.realm === 4 ? '渡劫' : '破境');
+  $('#ev-seal').textContent = '劫';
+  $('#ev-result').innerHTML = '';
+  const box = $('#ev-choices'); box.innerHTML = ''; box.className = 'ev-choices';
+  let t = `你已至${r.name}${r.stages[r.stages.length - 1]}，${S.realm === 4 ? '天劫将临' : '关隘就在眼前'}。欲${S.realm === 4 ? '渡劫飞升' : '破' + next}，以你此刻的心境与根骨，把握${chanceWord(btChance(false))}。`;
+  if (has) t += `囊中尚有${pill}一${isFu ? '道，燃符' : '枚，服之'}可增二成把握。`;
+  if (S.inj > 0) t += '你身上伤势未愈，此时破境，凶险倍增。';
+  if (S.fails) t += `此前已败${cn(S.fails)}次，屡败屡战，心志愈坚。`;
+  const help = Core.npcHelp(S).who.map(id => NPCS[id].name);
+  if (help.length) t += `${help.join('、')}${help.length > 1 ? '皆' : ''}在洞府外为你护法。`;
+  if (K.btDeath[S.realm]) t += S.items['兵解玉符'] > 0 ? '此境破关，败则有身死之虞。好在袖中玉符温润，似在低语：纵使身殒，道不必绝。' : '此境破关，已非儿戏——一旦失手，便有身死道消之虞。';
+  if (S.gf && GONGFA[S.gf].mo && S.xj < 15) t += '魔功反噬在即，心神摇摇欲坠，此时破关，凶多吉少。';
+  openModal();
+  const d = inkWrite($('#ev-text'), t, { immediate: true, step: 20, cadence: true });
+  const opts = [];
+  if (has) opts.push({ label: isFu ? `燃${pill}，渡劫` : `服${pill}，破境`, sub: chanceWord(btChance(true)), go: true, pill: true });
+  opts.push({ label: has ? (isFu ? '不燃符，强行渡劫' : '不服丹，强行破境') : (isFu ? '凝神静气，渡劫' : '凝神静气，破境'), sub: chanceWord(btChance(false)), go: true, pill: false });
+  if (Redworld.canEnd(S)) opts.push({ label: '不渡，留在人间', sub: '红尘仙', hongchen: true });
+  opts.push({ label: '暂缓，再积累些时日', sub: '', go: false });
+  opts.forEach((o, i) => {
+    const b = document.createElement('button'); b.className = 'choice'; b.style.animationDelay = (500 + d * 0.5 + i * 120) + 'ms';
+    b.innerHTML = '<span></span><small></small>'; b.firstChild.textContent = o.label; b.lastChild.textContent = o.sub;
+    b.onclick = async () => {
+      if (box.classList.contains('chosen')) return; box.classList.add('chosen'); b.classList.add('picked');
+      await closeModal();
+      if (o.hongchen) { const end = Redworld.finish(S); if (end.err) toast(end.err); else { save(); showEnd('hongchen'); } }
+      else if (o.go) runBreak(o.pill);
+    };
+    box.appendChild(b);
+  });
+}
+async function runBreak(usePill) {
+  busy = true;
+  if ((S.realm | 0) === 4 && !(S.path && S.path.jiewen)) await openPathCeremony('jiewen', false);
+  const r = R(), B = buffer(), res = Core.resolveBreak(S, usePill, B.emit), from = res.from, ok = res.ok;
+  save();
+  const bt = $('#bt');
+  const meta = (typeof BtFx !== 'undefined') ? BtFx.prepare(bt, from, ok) : null;
+  bt.hidden = false;
+  const lines = $('#bt-lines'), a = $('#bt-a'), b = $('#bt-b'), txt = $('#bt-text'), close = $('#bt-close');
+  lines.innerHTML = ''; txt.textContent = ''; close.hidden = true; close.classList.remove('bleed-in');
+  const target = NEXT_REALM_NAME[from];
+  a.textContent = b.textContent = target;
+  if (!meta) $('#bt-stamp-t').textContent = ok ? '成' : '败';
+  await sleep(30); bt.classList.add('go');
+  await sleep(FX.reduced() ? 80 : (from === 4 ? 900 : 700));
+  if (typeof BtFx !== 'undefined') await BtFx.chargePhase(bt, from, usePill, r.pill);
+  else {
+    const l1 = document.createElement('div'); lines.appendChild(l1);
+    inkWrite(l1, usePill ? `${from === 4 ? '燃起' : '服下'}${r.pill}，凝神静气` : '凝神静气，抱元守一', { immediate: true, step: 60 });
+    await sleep(1100); bt.classList.add('charge');
+    const l2 = document.createElement('div'); lines.appendChild(l2);
+    inkWrite(l2, from === 4 ? '劫云压顶……' : '引天地灵气，冲击瓶颈……', { immediate: true, step: 70 });
+    await sleep(1900); bt.classList.remove('charge');
+  }
+  if (!FX.reduced() && FX.brushSweep) {
+    bt.classList.add('sweep');
+    const sealEl = $('#bt-stamp-t');
+    FX.brushSweep({ host: bt, seal: ok && sealEl ? sealEl.textContent : '', broken: !ok });
+  }
+  if (typeof BtFx !== 'undefined') await BtFx.revealPhase(bt, from, ok);
+  else {
+    bt.classList.add('reveal');
+    if (ok) {
+      await sleep(500); bt.classList.add('glory', 'weight');
+      if (typeof MoAudio !== 'undefined') { MoAudio.play('splash'); MoAudio.play('gold'); }
+      await sleep(760);
+    } else await sleep(1300);
+    if (!ok) {
+      if (typeof MoAudio !== 'undefined') MoAudio.play('fail');
+      bt.classList.add('fail', 'crack', 'shake'); await sleep(500);
+    }
+  }
+  if (!snappy()) { bt.classList.add('pomo'); await sleep(780); }
+  if (typeof MoAudio !== 'undefined') MoAudio.play('stamp');
+  bt.classList.add('stamped');
+  await sleep(FX.reduced() ? 80 : 480);
+  const logText = res.text;
+  if (res.ending) bt.classList.add('end-' + res.ending);
+  inkWrite(txt, logText, { immediate: true, step: 26 });
+  save();
+  await sleep(FX.reduced() ? 200 : 1500);
+  close.hidden = false; close.classList.add('bleed-in');
+  close.onclick = async () => {
+    bt.classList.add('leave'); await sleep(900); bt.hidden = true; bt.className = 'bt';
+    if (typeof BtFx !== 'undefined') BtFx.clearStage();
+    const cv = $('#inkfx'); if (cv.parentNode === bt) { InkGL.hide(); document.body.insertBefore(cv, $('#grain')); }
+    const ttl = ok ? (from === 4 ? '渡劫飞升' : `破境 · ${NEXT_REALM_NAME[from]}`) : { bingjie: '兵解', yunluo: '身殒', rumo: '入魔' }[res.ending] || '破境未果';
+    pushLog({ title: ttl, text: logText, cls: ok ? 'gold' : 'warn', div: true });
+    B.flush(); render(); save();
+    if (ok && res.pendingAscend && !res.needPath) Core.finishAscend(S);
+    if (ok && res.needPath) {
+      await openPathCeremony(res.needPath, !!res.pendingAscend);
+      busy = false; render(); save();
+      if (S.ascended) setTimeout(() => showEnd('ascend'), 1600); else checkEnd();
+      maybeFabaoCeremony();
+    } else {
+      busy = false;
+      if (S.ascended) setTimeout(() => showEnd('ascend'), 1600); else checkEnd();
+      maybeFabaoCeremony();
+    }
+  };
+}
+
+/* ================= 定型仪式 ================= */
+const PATH_LEAD = {
+  daoji: '筑基已成。丹田之中，一道虚影未定——此乃道基。一经落成，难再更易。择其一路，定下此后百年的修行之趋。',
+  danwen: '金丹凝成，丹面尚白。可刻一至二道丹纹。纹成之后，若要洗去，需以极重代价。',
+  faxiang: '元婴化形。识海之中，一尊法相将成。法相一定，斗法招式与机缘皆随之偏转。',
+  wendao: '化神之际，你站在天地之间。可问天、问心、或问地——一问即可。',
+  jiewen: '渡劫之前，先定劫纹。这一纹算在即将落下的这一劫上：刚劫破劫略利，失败时更易重伤；柔劫失败时稍安；忘劫不改凶险，只利心境与机缘。纹定之后，雷才落下。',
+};
+
+async function maybeFabaoCeremony() {
+  if (typeof FabaoArt === 'undefined' || !FabaoArt.flushIfAny) return;
+  await FabaoArt.flushIfAny();
+}
+function renderPathSeals() {
+  const el = $('#path-seals'); if (!el || !S) return;
+  const list = Core.pathSummary(S) || [];
+  if (!list.length) { el.innerHTML = ''; el.hidden = true; return; }
+  el.hidden = false;
+  el.innerHTML = list.map(x => `<span class="path-seal" data-k="${x.k}" title="${esc(x.name)}"><i>${esc(x.seal)}</i><b>${esc(x.name)}</b></span>`).join('');
+}
+function mountLoop(wrap) {
+  if (!wrap || typeof Loop === 'undefined' || !Loop.html || !S) return;
+  const host = document.createElement('div');
+  host.className = 'loop-host';
+  const paint = () => { host.innerHTML = Loop.html(S); };
+  paint();
+  host.addEventListener('click', e => {
+    const b = e.target.closest('[data-loop]');
+    if (!b || b.disabled) return;
+    const r = Loop.act(S, b.getAttribute('data-loop'), pushLog);
+    if (!r) return;
+    if (r.err) { toast(r.err); return; }
+    if (r.noop) { if (r.text) toast(r.text); }
+    else if (r.text) pushLog({ title: r.title || '道基', text: voice(r.text), tags: r.tags, cls: r.cls || 'event', div: true });
+    Core.checkXj(S, pushLog);
+    save(); render();
+    if (S.dead || r.ending) { checkEnd(); closeSheet(); return; }
+    paint();
+  });
+  wrap.appendChild(host);
+}
+function pathPage() {
+  const wrap = document.createElement('div'); wrap.className = 'path-page';
+  const list = Core.pathSummary(S) || [];
+  if (!list.length) {
+    wrap.innerHTML = `<div class="path-empty"><span class="path-empty-seal">空</span><p>道基未定。破境筑基之时，自有虚影落于丹田——那时，再择。</p><p class="path-empty-hint">金丹刻纹、元婴法相、化神问道、渡劫劫纹，亦各有一择。</p></div>`;
+    mountLoop(wrap);
+    return wrap;
+  }
+  wrap.innerHTML = list.map(x => {
+    let o = null;
+    if (x.k === 'danwen') { const oid = (S.path.danwen || []).find(i => DANWEN[i] && DANWEN[i].seal === x.seal); o = DANWEN[oid]; }
+    else o = PATH_TABLE[x.k][S.path[x.k]];
+    return `<div class="path-card"><span class="path-card-seal">${esc(x.seal)}</span><div><b>${esc(PATH_KIND[x.k].name)} · ${esc(x.name)}</b><p>${esc(o ? o.trait : '')}</p><small>${esc(o ? o.desc : '')}</small></div></div>`;
+  }).join('');
+  const washBox = document.createElement('div'); washBox.className = 'path-wash';
+  const bits = [];
+  if (S.path && S.path.danwen && S.path.danwen.length) {
+    const c = Core.pathWashCost(S, 'danwen');
+    bits.push(`<button type="button" class="path-wash-btn" data-w="danwen">洗去丹纹<small>灵石 ${fmtNum(c.ls)} · 寿 −${c.life} · 心境 −${c.xj}</small></button>`);
+  }
+  if (S.path && S.path.daoji) {
+    const c = Core.pathWashCost(S, 'daoji');
+    bits.push(`<button type="button" class="path-wash-btn danger" data-w="daoji">震散道基<small>灵石 ${fmtNum(c.ls)} · 寿 −${c.life} · 心境 −${c.xj} · 近乎自毁</small></button>`);
+  }
+  if (S.path && S.path.faxiang) {
+    const c = Core.pathWashCost(S, 'faxiang');
+    const half = S.flags && S.flags.xiang_wash_half;
+    bits.push(`<button type="button" class="path-wash-btn" data-w="faxiang">洗去法相<small>${half ? '相裂半价 · ' : ''}灵石 ${fmtNum(c.ls)} · 寿 −${c.life} · 心境 −${c.xj}</small></button>`);
+  }
+  if (S.path && S.path.wendao) {
+    const c = Core.pathWashCost(S, 'wendao');
+    bits.push(`<button type="button" class="path-wash-btn" data-w="wendao">洗去问道<small>灵石 ${fmtNum(c.ls)} · 寿 −${c.life} · 心境 −${c.xj}</small></button>`);
+  }
+  if (S.path && S.path.jiewen && !S.ascended) {
+    const c = Core.pathWashCost(S, 'jiewen');
+    bits.push(`<button type="button" class="path-wash-btn danger" data-w="jiewen">磨去劫纹<small>灵石 ${fmtNum(c.ls)} · 寿 −${c.life} · 心境 −${c.xj} · 飞升前可另择</small></button>`);
+  }
+  if (bits.length) {
+    const xiangLive = S.karma && (S.karma.seeds || []).some(k => k.id === 'xiang_fan') && !(S.flags && S.flags.karma_done_xiang_fan);
+    const xiangNote = xiangLive ? '尚未裂开的相裂还挂在行迹上，洗去法相后标作已消。' : '';
+    washBox.innerHTML = `<p class="path-wash-note">定型可洗，代价极重。洗后须重新择定。法相／问道／劫纹（飞升前）皆可洗；若逢「相裂」，洗相代价略减。${xiangNote}</p>${bits.join('')}`;
+    washBox.onclick = async e => {
+      const b = e.target.closest('[data-w]'); if (!b) return;
+      const kind = b.dataset.w;
+      let title = ({ danwen: '洗去丹纹？纹成难易，此举耗寿伤神。', faxiang: '洗去法相？识海空明一阵，须待机缘再凝。', wendao: '洗去问道？天地之间那一问将被拔出，须得再问。', jiewen: '磨去劫纹？雷痕将淡，渡劫飞升前尚可另择一纹。', daoji: '震散道基？百年倾向尽废，寻常修士视为自毁。' })[kind];
+      if (kind === 'faxiang' && S.karma && (S.karma.seeds || []).some(k => k.id === 'xiang_fan') && !(S.flags && S.flags.karma_done_xiang_fan)) title += '行迹里尚未上门的相裂，会一并标作已消。';
+      const conf = ({ danwen: '洗纹', faxiang: '洗相', wendao: '洗问', jiewen: '洗劫', daoji: '易基' })[kind];
+      if (!(await inkConfirm(title, conf, true))) return;
+      const r = Core.washPath(S, kind, pushLog);
+      if (r.err) { toast(r.err); return; }
+      save(); render();
+      await closeSheet();
+      await ensurePendingPath();
+    };
+    wrap.appendChild(washBox);
+  }
+  mountLoop(wrap);
+  return wrap;
+}
+let pathCerGen = 0;
+async function openPathCeremony(kind, pendingAscend) {
+  const meta = PATH_KIND[kind], tab = PATH_TABLE[kind];
+  if (!meta || !tab) return;
+  const pc = $('#path-cer'); if (!pc) return;
+  const gen = ++pathCerGen;
+  busy = true;
+  pc.hidden = false; pc.className = 'path-cer go kind-' + kind;
+  $('#path-cer-seal').textContent = meta.seal;
+  $('#path-cer-title').textContent = meta.name;
+  $('#path-cer-lead').textContent = '';
+  const opts = $('#path-cer-opts'); opts.innerHTML = ''; opts.className = 'path-cer-opts';
+  const foot = $('#path-cer-foot'); foot.hidden = false;
+  const confBtn = $('#path-cer-confirm');
+  const confLab = confBtn.querySelector('.bb-text') || confBtn;
+  const hint = $('#path-cer-hint');
+  $('#path-cer-prose').textContent = '';
+  inkWrite($('#path-cer-lead'), PATH_LEAD[kind] || '', { immediate: true, step: 22 });
+  await sleep(400);
+  const selected = new Set();
+  const max = meta.max, pickN = meta.pick;
+  const syncFoot = () => {
+    const n = selected.size;
+    const ready = n >= pickN;
+    foot.hidden = false;
+    confBtn.disabled = !ready;
+    confBtn.classList.toggle('dim', !ready);
+    confLab.textContent = ready ? (meta.irrev ? '落定 · 难再更易' : '落定') : (max > 1 ? `再择（已选${cn(n)}）` : '落定');
+    if (hint) {
+      if (!n) hint.textContent = '点选一路，再落定';
+      else if (!ready) hint.textContent = max > 1 ? `可多选至${cn(max)}道，至少${cn(pickN)}道` : '点下方落定';
+      else hint.textContent = meta.irrev ? '落定后难再更易 · Enter 亦可' : '确认后落定 · Enter 亦可';
+    }
+  };
+  const ids = Object.keys(tab);
+  ids.forEach((id, i) => {
+    const o = tab[id];
+    const b = document.createElement('button');
+    const mem = (kind === 'daoji' && S.flags && S.flags.daojiMem === id) || (kind === 'faxiang' && S.flags && S.flags.faxiangMem === id);
+    b.className = 'path-opt' + (mem ? ' mem' : ''); b.style.animationDelay = (180 + i * 90) + 'ms';
+    b.type = 'button';
+    const memTag = mem ? '<i class="po-mem">残忆</i>' : '';
+    b.innerHTML = `<span class="po-seal">${esc(o.seal)}</span><div class="po-body"><b>${esc(o.name)}${memTag}</b><em>${esc(o.trait)}</em><p></p></div>`;
+    b.querySelector('p').textContent = o.desc;
+    b.onclick = () => {
+      if (opts.classList.contains('locked')) return;
+      if (max === 1) {
+        selected.clear();
+        opts.querySelectorAll('.path-opt').forEach(x => x.classList.remove('on'));
+        selected.add(id); b.classList.add('on');
+      } else {
+        if (selected.has(id)) { selected.delete(id); b.classList.remove('on'); }
+        else if (selected.size < max) { selected.add(id); b.classList.add('on'); }
+        else { toast(`至多${cn(max)}道`); return; }
+      }
+      syncFoot();
+    };
+    opts.appendChild(b);
+  });
+  syncFoot();
+  await new Promise(resolve => {
+    confBtn.onclick = async () => {
+      if (selected.size < pickN || opts.classList.contains('locked') || confBtn.disabled) return;
+      opts.classList.add('locked');
+      const list = [...selected];
+      const B = buffer();
+      const r = Core.choosePath(S, kind, list, null);
+      if (r.err) { toast(r.err); opts.classList.remove('locked'); return; }
+      save();
+      foot.hidden = true;
+      const prose = $('#path-cer-prose');
+      pc.classList.add('sealed');
+      if (typeof MoAudio !== 'undefined') { MoAudio.play('stamp'); MoAudio.play('gold'); }
+      inkWrite(prose, r.text || '', { immediate: true, step: 28 });
+      B.flush();
+      await sleep(2200);
+      if (gen !== pathCerGen) { resolve(); return; }
+      pc.classList.add('leave'); await sleep(800);
+      if (gen !== pathCerGen) { resolve(); return; }
+      pc.hidden = true; pc.className = 'path-cer';
+      if (pendingAscend) Core.finishAscend(S, pushLog);
+      pushLog({ title: meta.name + ' · ' + r.names, text: r.text, tags: r.tags, cls: 'gold', div: true });
+      resolve();
+    };
+  });
+}
+async function ensurePendingPath() {
+  if (!S || S.dead || S.ascended) return;
+  let guard = 0;
+  while (guard++ < 5) {
+    if (busy) return;
+    const k = Core.pendingPath(S);
+    if (!k) break;
+    await openPathCeremony(k, false);
+    busy = false; render(); save();
+  }
+}
+
+/* ================= 宗门 ================= */
+const TOKEN_MAT = {
+  木: ['#8a6744', '#4e3622', '#efdfbd'], 青玉: ['#7fa896', '#3d6556', '#f2f7f0'], 白玉: ['#f6f2e6', '#d3ccb8', '#2a2622'],
+  墨玉: ['#34312c', '#100f0d', '#d4b06a'], 赤金: ['#c87a44', '#7a2f18', '#f8e6b8'], 紫金: ['#e0c06e', '#94702e', '#3a2a10'],
+  铁: ['#6a6a66', '#2c2c2a', '#e6e2d8'], 青铜: ['#7d9474', '#3b5040', '#eef2e6'], 乌金: ['#3c3732', '#161412', '#d4b06a'],
+  玄铁: ['#39414b', '#11151a', '#d8dde2'], 赤铜: ['#b8683e', '#6a2a18', '#f8e6c8'], 紫铜: ['#a56452', '#5a2a24', '#f8e2d2'],
+};
+let tokenSeq = 0;
+function tokenSVG(orgId, rank, big) {
+  const o = ORGS[orgId], mat = TOKEN_MAT[o.token[rank]] || TOKEN_MAT['木'], id = 'tk' + (++tokenSeq);
+  const name = o.ranks[rank].replace('弟子', ''), chars = [...name], n = chars.length;
+  const fs = n <= 2 ? 44 : 34, y0 = n <= 2 ? 151 : 128, gap = n <= 2 ? 52 : 40;
+  const txt = chars.map((c, i) => `<text x="70" y="${y0 + i * gap}" text-anchor="middle" font-size="${fs}" class="seal-font" fill="${mat[2]}">${c}</text>`).join('');
+  const shape = 'M22 70 Q20 40 46 36 Q54 10 70 10 Q86 10 94 36 Q120 40 118 70 L118 262 Q118 276 104 276 L36 276 Q22 276 22 262 Z';
+  return `<svg viewBox="0 0 140 340" class="token-svg${big ? ' big' : ''}"><defs>
+    <linearGradient id="${id}g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${mat[0]}"/><stop offset="1" stop-color="${mat[1]}"/></linearGradient>
+    <linearGradient id="${id}s" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#fff" stop-opacity="0"/><stop offset=".5" stop-color="#fff" stop-opacity=".55"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
+    <clipPath id="${id}c"><path d="${shape}"/></clipPath></defs>
+    <path class="tk-cord" d="M70 22 L70 -40" />
+    <path d="${shape}" fill="url(#${id}g)" stroke="rgba(0,0,0,.35)" stroke-width="1.5"/>
+    <path d="M30 74 Q30 48 50 44 Q58 20 70 20 Q82 20 90 44 Q110 48 110 74 L110 258 Q110 268 100 268 L40 268 Q30 268 30 258 Z" fill="none" stroke="${mat[2]}" stroke-opacity=".45" stroke-width="1.4"/>
+    <circle cx="70" cy="30" r="5" fill="rgba(0,0,0,.45)"/>
+    <text x="70" y="${n <= 2 ? 92 : 88}" text-anchor="middle" font-size="15" letter-spacing="4" class="seal-font" fill="${mat[2]}" opacity=".8">${o.short}</text>
+    ${txt}
+    <g clip-path="url(#${id}c)"><rect class="tk-sheen" x="-160" y="-20" width="90" height="400" fill="url(#${id}s)" transform="rotate(18 70 170)"/></g>
+    <g class="tk-tassel"><path d="M70 276 L70 300" stroke="#9e2a22" stroke-width="3"/><circle cx="70" cy="302" r="5" fill="#9e2a22"/>
+    ${[-7, -3.5, 0, 3.5, 7].map(dx => `<path d="M${70 + dx * .4} 306 Q${70 + dx} 320 ${70 + dx * 1.3} 338" stroke="#b3302a" stroke-width="1.6" fill="none"/>`).join('')}</g></svg>`;
+}
+const gradeNames = ['凡', '灵', '地', '天'];
+function openSect(tab) {
+  const o = Core.org(S);
+  const tabs = o ? [['home', o.id === 'qm' ? '宗门' : '盟中'], ['task', '任务'], ['lib', o.id === 'qm' ? '藏经' : '秘库'], ['npc', '人物']] : [['home', '散修'], ['npc', '人物']];
+  if (S.adult && S.adult.started) tabs.push(['contacts', '旧友']);
+  tab = tab && tabs.find(t => t[0] === tab) ? tab : tabs[0][0];
+  const wrap = document.createElement('div'); wrap.className = 'bag-wrap sect-wrap';
+  wrap.innerHTML = `<div class="sheet-tabs">${tabs.map((t, i) => `${i ? '<i class="stab-dot"></i>' : ''}<button class="stab" data-t="${t[0]}">${t[1]}</button>`).join('')}</div><div class="tab-body"></div>`;
+  const body = wrap.querySelector('.tab-body');
+  const title = t => ({ home: o ? o.name : '散修', task: o && o.id === 'sx' ? '盟中悬赏' : '宗门任务', lib: o ? o.lib : '', npc: '人物', contacts: '旧友 · 各自的日子' })[t];
+  const show = t => {
+    wrap.querySelectorAll('.stab').forEach(b => b.classList.toggle('on', b.dataset.t === t));
+    $('#sheet-title').textContent = title(t);
+    body.innerHTML = ''; body.appendChild({ home: sectHome, task: sectTasks, lib: sectLib, npc: sectNpc, contacts: adultContactsView }[t]());
+    body.classList.remove('tab-in'); void body.offsetWidth; body.classList.add('tab-in');
+    $('#sheet-body').scrollTop = 0;
+  };
+  wrap.querySelector('.sheet-tabs').onclick = e => { const t = e.target.closest('.stab'); if (t) show(t.dataset.t); };
+  openSheet(title(tab), wrap);
+  show(tab);
+}
+function dabiWhen(o, sc, r) {
+  const best = sc.dabiBest >= 0 ? `<br>最佳名次 · ${DABI_PLACE[sc.dabiBest]}` : '';
+  if (r > 3) return `${o.dabi} · 你已列席观礼${best}`;
+  const yrs = cn(Math.max(1, Math.ceil((sc.dabiAt - S.months) / 12)));
+  if (sc.dabiDue) return `本届待参加 · ${o.dabi}<br>下届约${yrs}年后${best}`;
+  return `下届${o.dabi} · 约${yrs}年后${best}`;
+}
+function sectHome() {
+  const w = document.createElement('div'); w.className = 'sect-home';
+  const o = Core.org(S), sc = S.sect;
+  if (!o) {
+    w.innerHTML = `<div class="sect-card free"><div class="sect-card-v">${[...(sc.free ? '逍遥' : '散修')].map(c => `<i>${c}</i>`).join('')}</div>
+      <div class="sect-card-info"><div class="sect-org">无门无派</div><p class="sect-note">${sc.free ? '你谢绝了宗门的招揽。山高水长，无人管束，游历之中，机缘自会寻上门来。' : '伪灵根不入宗门之眼。可天下之大，总有一扇门，会为肯走路的人打开。'}</p>
+      <div class="perk"><b>${sc.free ? '逍遥' : '机缘'}</b><span>${sc.free ? '游历机缘更盛，所得修为更丰' : '筑基之后，或有宗门来招；坊市之中，亦有散修结盟'}</span></div></div></div>`;
+    return w;
+  }
+  const r = sc.rank, cp = Core.canPromote(S), libCap = RANK_LIB[r];
+  const pay = Math.round(o.ls[r] * REALMS[S.realm].lsScale);
+  w.innerHTML = `<div class="sect-card"><div class="sect-token">${tokenSVG(o.id, r)}</div>
+    <div class="sect-card-info"><div class="sect-org">${o.name}</div><div class="sect-rank">${o.ranks[r]}</div>
+    <div class="sect-gx"><span>可用贡献 <b>${fmtNum(sc.gx)}</b></span><span>累计 <b>${fmtNum(sc.gxTotal)}</b></span></div></div></div>
+    <div class="perks">
+      <div class="perk"><b>俸禄</b><span>每${cn(K.payYears * R().T)}年 灵石${cn(pay)}${r >= 2 ? ' · 时有丹药' : ''}${K.stipendPill[r] ? ' · 偶赐破境丹' : ''}</span></div>
+      <div class="perk"><b>灵脉</b><span>${o.cave[r] > 1 ? `闭关修为 +${Math.round((o.cave[r] - 1) * 100)}%` : '杂役居所，灵气稀薄'}</span></div>
+      <div class="perk"><b>${o.lib.slice(0, 2)}</b><span>${libCap < 0 ? '杂役不得入阁' : `可入${gradeNames.slice(0, libCap + 1).join('、')}品诸层`}</span></div>
+      ${(() => { const h = Core.npcHelp(S).who; return h.length ? `<div class="perk"><b>护法</b><span>${h.map(id => NPCS[id].name).join('、')} · 破境把握更增</span></div>` : ''; })()}
+    </div>
+    ${r < 6 ? `<div class="promo">
+      <div class="promo-h"><span>晋升</span><em>${o.ranks[r + 1]}</em></div>
+      <div class="req ${cp.gxOk ? 'ok' : ''}"><span>累计贡献</span><div class="req-bar"><i style="width:${Math.min(100, sc.gxTotal / cp.need.gx * 100).toFixed(1)}%"></i></div><b>${fmtNum(sc.gxTotal)} / ${fmtNum(cp.need.gx)}</b></div>
+      <div class="req ${cp.realmOk ? 'ok' : ''}"><span>境界</span><div class="req-word">${REALMS[cp.need.realm].name}${cp.need.stage ? REALMS[cp.need.realm].stages[cp.need.stage] : ''}以上</div><b>${cp.realmOk ? '已足' : '未足'}</b></div>
+      <button class="brush-btn small promo-btn" ${cp.ok ? '' : 'disabled'}><span class="bb-ink"></span><span class="bb-text">请升${o.ranks[r + 1].replace('弟子', '')}</span></button>
+    </div>` : '<div class="sect-note center">位极一宗，再无可升。</div>'}
+    <div class="dabi-line">${dabiWhen(o, sc, r)}</div>
+    <button type="button" class="defect-btn" id="btn-defect">叛宗<small>解牌下山 · 代价极重</small></button>`;
+  const pb = w.querySelector('.promo-btn');
+  if (pb) pb.onclick = async () => { if (!Core.canPromote(S).ok) return; await closeSheet(); const res = Core.promote(S, pushLog); if (res) runRite(res); };
+  const db = w.querySelector('#btn-defect');
+  if (db) db.onclick = async () => {
+    const cost = (() => { try { const lsS = REALMS[S.realm].lsScale; return Math.round(800 * lsS); } catch (e) { return 800; } })();
+    if (!(await inkConfirm(`叛出${o.name}？需灵石约${fmtNum(cost)}，并折寿伤神。此后为逍遥散修。`, '叛宗', true))) return;
+    const res = Core.defect(S, pushLog);
+    if (res.err) { toast(res.err); return; }
+    await closeSheet(); render(); save();
+  };
+  return w;
+}
+function sectTasks() {
+  const w = document.createElement('div'); w.className = 'tasks';
+  const ms = Core.ensureMissions(S); save();
+  if (!ms.length) { w.innerHTML = '<div class="empty">执事堂案上暂无新令<br><small>榜一季一换，不妨先闭关或出山</small></div>'; return w; }
+  ms.forEach(mi => {
+    const info = Core.missionInfo(S, mi);
+    const c = document.createElement('div'); c.className = 'task r' + Math.min(3, Math.floor(info.risk / 0.12));
+    c.innerHTML = `<span class="task-seal">${info.m.seal}</span><div class="task-info"><div class="task-name">${info.name}</div><p class="task-brief"></p>
+      <div class="task-meta"><span>耗时 ${cnDur(info.duration)}</span><span class="risk">${info.riskWord}</span></div>
+      <div class="task-pay">酬 · 贡献 ${fmtNum(info.gx)} · 灵石 ${fmtNum(info.ls)}</div></div><button class="item-use">接令</button>`;
+    c.querySelector('.task-brief').textContent = info.brief;
+    c.querySelector('button').onclick = async () => { await closeSheet(); const ev = Core.missionEvent(S, mi.uid); if (ev) openEvent(ev); };
+    w.appendChild(c);
+  });
+  const every = Core.missionEvery(S), left = Math.max(1, Math.ceil((S.sect.mAt + every - S.months) / 12));
+  const f = document.createElement('div'); f.className = 'sect-note center'; f.textContent = `执事堂的告示，约${cn(left)}年一换`; w.appendChild(f);
+  return w;
+}
+function sectLib() {
+  const w = document.createElement('div'); w.className = 'lib';
+  const o = Core.org(S);
+  w.innerHTML = `<div class="lib-h"><span>${o.lib}</span><em>可用贡献 ${fmtNum(S.sect.gx)}</em></div>`;
+  let lastG = -1;
+  Core.libList(S).forEach(it => {
+    if (it.g.grade !== lastG) { lastG = it.g.grade; const h = document.createElement('div'); h.className = 'lib-floor'; h.textContent = `${gradeNames[lastG]}品 · ${['一', '二', '三', '顶'][lastG]}层`; w.appendChild(h); }
+    const row = document.createElement('div'); row.className = 'gf-row lib-row g' + it.g.grade + (it.open ? '' : ' locked') + (it.known ? ' known' : '');
+    const needRank = RANK_LIB.findIndex(x => x >= it.g.grade);
+    row.innerHTML = `<span class="gf-seal">${GF_GRADE[it.g.grade]}</span><div class="gf-row-info"><div class="gf-row-name">${it.g.name}</div>
+      <div class="gf-row-sub">${gfElWord(it.id)} · ×${Core.gfSpeed(S, it.id).toFixed(2)}</div><div class="gf-row-trait">${it.g.trait}</div>
+      <div class="gf-cost">耗贡献 ${fmtNum(it.cost)}，录入胸中</div></div>
+      <button class="item-use" ${!it.open || it.known || S.sect.gx < it.cost ? 'disabled' : ''}>${it.known ? '已习' : !it.open ? `需${o.ranks[needRank].replace('弟子', '')}` : `${fmtNum(it.cost)}`}</button>`;
+    const btn = row.querySelector('button');
+    btn.onclick = () => {
+      if (!row.classList.contains('confirm')) { w.querySelectorAll('.lib-row.confirm').forEach(r => { r.classList.remove('confirm'); }); row.classList.add('confirm'); btn.textContent = '研习'; return; }
+      const res = Core.learnLib(S, it.id, pushLog); if (res.err) { toast(res.err); return; }
+      pushLog({ title: o.lib, text: `你在${o.lib}中静坐三日，将《${it.g.name}》一字一句抄录于心。合上书页时，窗外的松影已移过了半面墙。`, tags: res.tags, cls: 'event', div: true });
+      render(); save(); const body = w.parentNode; body.innerHTML = ''; body.appendChild(sectLib()); toast(`得《${it.g.name}》`);
+    };
+    w.appendChild(row);
+  });
+  return w;
+}
+function sectNpc() {
+  if (typeof People !== 'undefined') People.ensure(S);
+  const w = document.createElement('div'); w.className = 'npcs';
+  const ids = Object.keys(NPCS);
+  const knownIds = [], unknownIds = [];
+  ids.forEach(id => {
+    const st = S.npc[id] || { met: false, a: 0 };
+    const seen = st.met && (id !== 'shifu' || (S.sect && S.sect.master));
+    (seen ? knownIds : unknownIds).push(id);
+  });
+  knownIds.forEach(id => {
+    const n = NPCS[id], st = S.npc[id], c = document.createElement('div');
+    c.className = 'npc' + (st.a < -10 ? ' foe' : st.a >= 50 ? ' close' : '');
+    const pct = (st.a + 100) / 2;
+    c.innerHTML = `<span class="npc-seal">${n.seal}</span><div class="npc-info"><div class="npc-name">${n.name}<em>${Core.npcWord(st.a)}</em></div>
+      <div class="npc-title">${n.title}</div><div class="npc-trait">${n.trait}</div>
+      <div class="npc-aff"><i style="left:${Math.min(50, pct)}%;width:${Math.abs(pct - 50)}%" class="${st.a < 0 ? 'neg' : ''}"></i><b></b></div>
+      <p class="npc-line"></p></div>`;
+    c.querySelector('.npc-line').textContent = (st.dead ? '旧言：' : '') + voice(Core.npcLine(S, id));
+    if (typeof People !== 'undefined') {
+      const details = document.createElement('p'); details.className = 'npc-line';
+      details.textContent = People.summary(S, id); c.querySelector('.npc-info').appendChild(details);
+      const localContact = id.indexOf('village_') === 0 && S.adult && S.adult.started ? Adulthood.contacts(S).find(row => row.c.id === id) : null;
+      const presentHere = People.present(S, id) && (!localContact || localContact.present);
+      if (presentHere && !st.absolute) {
+        const actions = document.createElement('div'); actions.className = 'loop-actions';
+        const mate = S.karma && S.karma.mate === id && !(S.bond && S.bond.lost);
+        const kinds = [['talk', '叙话', 1]].concat(mate ? [['gift', '赠清心丹', 1], ['sit', '共修', 3], ['past', '问往事', 1], ['promise', '约一年内共修', 0]] : []);
+        kinds.forEach(([kind, name, months]) => {
+          const b = document.createElement('button'); b.className = 'path-wash-btn'; b.type = 'button';
+          b.textContent = name + (months ? ' · ' + cnDur(Core.timeMonths(S, months)) : '');
+          let reason = '';
+          if (S.months < (st.life.nextAct || 0)) reason = '这一季的话已说过 · 还余' + cnDur(Math.max(0, (st.life.nextAct || 0) - S.months));
+          else if (kind === 'gift' && !(S.items['清心丹'] > 0)) reason = '囊中无清心丹';
+          else if (kind === 'promise' && S.bond && S.bond.promiseDue) reason = '上一次约定还未履行';
+          b.disabled = !!reason;
+          if (reason) b.title = reason;
+          b.setAttribute('aria-label', b.textContent + (reason ? ' · ' + reason : ''));
+          b.onclick = () => {
+            const r = People.interact(S, id, kind, pushLog);
+            if (r.err) { toast(r.err); return; }
+            pushLog({ title: r.title, text: voice(r.text), tags: r.tags, cls: 'event' });
+            Core.checkXj(S, pushLog); save(); render();
+            if (S.dead) { closeSheet(); checkEnd(); return; }
+            w.replaceWith(sectNpc());
+          };
+          actions.appendChild(b);
+        });
+        if (mate && S.bond && S.bond.promiseDue) {
+          const due = document.createElement('p'); due.className = 'loop-note'; due.textContent = '共修之约 · 还余' + cnDur(Math.max(0, S.bond.promiseDue - S.months)); actions.appendChild(due);
+        }
+        c.querySelector('.npc-info').appendChild(actions);
+      }
+    }
+    w.appendChild(c);
+  });
+  if (unknownIds.length) {
+    const note = document.createElement('p'); note.className = 'npc-unseen';
+    const masterWait = unknownIds.indexOf('shifu') >= 0 && S.sect && S.sect.org === 'qm' && !S.sect.master;
+    const rest = unknownIds.length - (masterWait ? 1 : 0);
+    const bits = [];
+    if (masterWait) bits.push('师父尚在峰上。晋内门弟子，方可拜见。');
+    if (rest > 0) bits.push(knownIds.length ? '其余' + cn(rest) + '人，尚未遇见。' : '人物尚未遇见。');
+    note.textContent = bits.join('');
+    w.appendChild(note);
+  }
+  return w;
+}
+/* 晋升：令牌显现 */
+async function runRite(res) {
+  busy = true;
+  const el = $('#rite'), o = Core.org(S);
+  el.className = 'rite'; el.hidden = false;
+  $('#rite-token').innerHTML = tokenSVG(o.id, res.rank, true);
+  $('#rite-title').innerHTML = `<span>晋</span>${res.name}`;
+  $('#rite-text').textContent = ''; $('#rite-tags').innerHTML = ''; $('#rite-close').hidden = true;
+  await sleep(30); el.classList.add('go');
+  await sleep(FX.reduced() ? 100 : 1300);
+  el.classList.add('show');
+  await sleep(FX.reduced() ? 100 : 1900);
+  el.classList.add('stamped');
+  await sleep(500);
+  const d = inkWrite($('#rite-text'), res.text, { immediate: true, step: 24 });
+  $('#rite-tags').innerHTML = res.tags.map(x => `<span class="${x.c || ''}">${x.t}</span>`).join('');
+  await sleep(Math.min(d, 2400) + 300);
+  $('#rite-tags').classList.add('bleed-in');
+  const close = $('#rite-close'); close.hidden = false; close.classList.add('bleed-in');
+  close.onclick = async () => {
+    el.classList.add('leave'); await sleep(900); el.hidden = true; el.className = 'rite';
+    const cv = $('#inkfx'); if (cv.parentNode === el) { InkGL.hide(); document.body.insertBefore(cv, $('#grain')); }
+    busy = false;
+    pushLog({ title: `晋升 · ${res.name}`, text: res.text, tags: res.tags, cls: 'gold', div: true });
+    render(); save(); checkEnd();
+  };
+}
+/* 大比 */
+let dabiOpen = false;
+function dabiInvite() {
+  if (!S || S.dead || !S.sect.dabiDue || busy || dabiOpen || !modal.hidden || !sheet.hidden || !$('#bt').hidden || !$('#rite').hidden) return;
+  const o = Core.org(S); if (!o) { S.sect.dabiDue = false; return; }
+  dabiOpen = true;
+  const ev = { id: 'dabi', title: o.dabi, seal: '比',
+    text: () => {
+      const roster = Core.dabiRoster(S);
+      S.evFoeMeta = { roster };
+      const who = roster.map(r => `${r.name}（${r.read}）`).join('、');
+      const head = {
+        qm: `${o.dabi}，${cn(K.dabiYears * R().T)}年一度。演武台上的青石被扫得发亮，八名弟子的名牌挂在台前，其中一块，写着你的名字。台下人山人海，执事堂的老执事敲了三下铜锣。`,
+        dx: `${o.dabi}开炉。丹坪上的青石被扫净，炉烟压得很低。名牌挂在台前，其中一块写着你的名字。`,
+        yy: `${o.dabi}。影坪无灯，名牌却自己浮出来，其中一块是你的。`,
+        xj: `${o.dabi}。演机坪的铜铃响了三声，名牌按机纹排开，有一块写着你的名字。`,
+        sx: `${o.dabi}开擂。坊市里的赌档早早开了盘口，木牌上你的名字排在前列。`,
+      }[o.id] || `${o.dabi}将启。名牌上有你的名字。`;
+      return `${head}这一回签上的对手，是${who}。`;
+    },
+    choices: () => [
+      { label: '登台', sub: '三战定名次', act: () => ({ text: '你整了整衣袍，一步步走上演武台。台下喧哗忽然远了。斗法将起。', fx: {}, tags: [{ t: '斗法将起' }], prelude: 1, after: startDabi }) },
+      { label: '托病不出', sub: '贡献 · 心境稍减', act: s => { s.sect.dabiDue = false; s._dabiBracket = null; return { text: '你递了一张告假条。那块写着你名字的名牌，被执事默默摘了下来。', fx: { gx: -2, xj: -2 } }; } },
+    ] };
+  openEvent(ev);
+  setTimeout(() => { dabiOpen = false; }, 1500);
+}
+const DM = Object.fromEntries(DUEL_MOVES.map(m => [m.id, m]));
+let duelState = null;
+function hpPips(n, lost) { return Array.from({ length: 3 }, (_, i) => `<i class="${i >= n ? 'lost' : ''}${lost && i === n ? ' hit' : ''}"></i>`).join(''); }
+async function startDabi() {
+  busy = true;
+  const t = Core.dabiNew(S), o = Core.org(S), el = $('#duel');
+  el.className = 'duel'; el.hidden = false;
+  $('#duel-ttl').textContent = o.dabi;
+  $('#duel-mname').textContent = S.name;
+  $('#duel-mstyle').textContent = `${REALMS[S.realm].name}${REALMS[S.realm].stages[S.stage]}${S.gf ? ' · 《' + GONGFA[S.gf].name + '》' : ''}`;
+  await sleep(30); el.classList.add('go');
+  const beat = []; let place = 0;
+  for (let r = 0; r < 3; r++) {
+    const won = await runDuel(t, r);
+    if (won) { place = r + 1; if (t.opps[r].npc) beat.push(t.opps[r].npc); } else break;
+  }
+  const res = Core.dabiFinish(S, place, beat);
+  await sleep(300);
+  el.classList.add('leave'); await sleep(900); el.hidden = true; el.className = 'duel';
+  busy = false;
+  pushLog({ title: `${o.dabi} · ${DABI_PLACE[place]}`, text: res.text, tags: res.tags, cls: place >= 2 ? 'gold' : 'event', div: true });
+  render(); save(); checkEnd();
+}
+function runDuel(t, r, o = {}) {
+  return new Promise(async resolve => {
+    const opp = t.opps[r], d = Core.duelNew(S, opp); duelState = d;
+    const el = $('#duel');
+    el.classList.remove('over', 'won', 'lost', 'strike', 'clash-on', 'hit-me', 'hit-o');
+    $('#duel-rd').textContent = o.rd || DABI_ROUND[r];
+    $('#duel-oname').textContent = opp.name.replace(/^.* · /, '');
+    $('#duel-ostyle').textContent = (o.title || (opp.npc ? NPCS[opp.npc].title : opp.name.split(' · ')[0] + '弟子')) + ' · ' + STYLE_WORD[opp.style];
+    $('#duel-ohp').innerHTML = hpPips(3); $('#duel-mhp').innerHTML = hpPips(3);
+    $('#duel-round').textContent = ''; $('#duel-text').textContent = ''; $('#duel-tell').textContent = '';
+    $('#duel-next').hidden = true; $('#duel-stamp').className = 'duel-stamp';
+    el.classList.add('intro');
+    const moves = $('#duel-moves');
+    moves.innerHTML = DUEL_MOVES.map(m => `<button class="dmove" data-m="${m.id}"><span class="dm-ink"></span><b>${m.ch}</b><small>${m.hint}</small></button>`).join('');
+    moves.classList.remove('on');
+    if (d.askWeapon) {
+      const ask = document.createElement('button'); ask.className = 'dmove'; ask.textContent = '问本命一句';
+      const quiet = document.createElement('button'); quiet.className = 'dmove'; quiet.textContent = '此战自己看';
+      moves.appendChild(ask); moves.appendChild(quiet);
+      moves.querySelectorAll('[data-m]').forEach(b => { b.hidden = true; }); moves.classList.add('on');
+      await new Promise(done => { ask.onclick = () => { d.weaponAsked = true; done(); }; quiet.onclick = done; });
+      ask.remove(); quiet.remove(); moves.querySelectorAll('[data-m]').forEach(b => { b.hidden = false; }); moves.classList.remove('on');
+    }
+    const intro = o.intro || (opp.npc ? DUEL_INTRO[opp.npc] : pick(DUEL_INTRO._).replace('对手', opp.name.replace(/^.* · /, '')));
+    await sleep(r === 0 ? 900 : 300);
+    const di = inkWrite($('#duel-tell'), intro, { immediate: true, step: 22 });
+    await sleep(Math.min(di, 1800) + 900);
+    el.classList.remove('intro');
+    const roundLoop = async () => {
+      const tl = Core.duelTell(d);
+      $('#duel-round').textContent = `第${cn(d.round + 1)}合`;
+      $('#duel-round').classList.remove('bleed-in'); void $('#duel-round').offsetWidth; $('#duel-round').classList.add('bleed-in');
+      $('#duel-text').textContent = '';
+      inkWrite($('#duel-tell'), tl.line, { immediate: true, step: 18 });
+      moves.querySelectorAll('.dmove').forEach(b => { b.disabled = b.dataset.m === 'qi' && !d.qi[0]; b.classList.remove('picked'); });
+      moves.classList.add('on');
+      moves.onclick = async e => {
+        const b = e.target.closest('.dmove'); if (!b || b.disabled || !moves.classList.contains('on')) return;
+        moves.classList.remove('on'); b.classList.add('picked');
+        const res = Core.duelRound(S, d, b.dataset.m);
+        await playClash(res, d);
+        if (d.over) {
+          el.classList.add('over', d.over === 'win' ? 'won' : 'lost');
+          $('#duel-stamp-t').textContent = d.over === 'win' ? '胜' : '负';
+          await sleep(500);
+          if (typeof MoAudio !== 'undefined') MoAudio.play(d.over === 'win' ? 'stamp' : 'fail');
+          $('#duel-stamp').classList.add('on');
+          await sleep(900);
+          const nx = $('#duel-next'); nx.hidden = false; nx.classList.remove('bleed-in'); void nx.offsetWidth; nx.classList.add('bleed-in');
+          nx.querySelector('.bb-text').textContent = o.last ? (d.over === 'win' ? '收剑' : '退走') : d.over === 'win' && r < 2 ? '再战' : '下台';
+          nx.onclick = () => { nx.onclick = null; resolve(d.over === 'win'); };
+        } else { await sleep(500); roundLoop(); }
+      };
+    };
+    roundLoop();
+  });
+}
+const SLASH_SEED = { gong: 3, shou: 11, shu: 17, qi: 29 };
+async function playClash(res, d) {
+  const el = $('#duel'), svg = $('#duel-slash'), sp = $('#duel-splash');
+  $('#dc-o').textContent = DM[res.o].ch; $('#dc-m').textContent = DM[res.m].ch;
+  el.classList.remove('clash-on', 'strike', 'hit-me', 'hit-o', 'big'); void el.offsetWidth;
+  el.classList.add('clash-on');
+  if (typeof MoAudio !== 'undefined') MoAudio.play('clash');
+  await sleep(FX.reduced() ? 60 : 520);
+  // 笔锋：胜者一笔斩向败者
+  const toO = res.dmg[0] > 0, toM = res.dmg[1] > 0, stall = !toO && !toM;
+  const mk = (seed, flip, color, delay) => {
+    const p = Ink.brushPath(420, 34, seed);
+    return `<g transform="translate(195 130) rotate(${flip ? 152 : -28}) translate(-210 -17)"><path class="sl" d="${p}" fill="${color}" style="animation-delay:${delay}s"/></g>`;
+  };
+  svg.innerHTML = stall ? mk(SLASH_SEED[res.m], false, 'rgba(239,230,211,.55)', 0) + mk(SLASH_SEED[res.o] + 5, true, 'rgba(239,230,211,.4)', .08)
+    : toO ? mk(SLASH_SEED[res.m], false, '#efe6d3', 0) : mk(SLASH_SEED[res.o] + 5, true, '#b3302a', 0);
+  el.classList.add('strike'); if (Math.max(...res.dmg) >= 2) el.classList.add('big');
+  if (!stall) {
+    sp.className = 'duel-splash ' + (toO ? 'to-o' : 'to-m'); void sp.offsetWidth; sp.classList.add('on');
+    if (typeof InkGL !== 'undefined' && InkGL.spreadOk && !FX.reduced() && Math.max(...res.dmg) >= 2) {}
+  }
+  await sleep(FX.reduced() ? 60 : 380);
+  if (toO) { $('#duel-ohp').innerHTML = hpPips(d.hp[1], true); el.classList.add('hit-o'); }
+  if (toM) { $('#duel-mhp').innerHTML = hpPips(d.hp[0], true); el.classList.add('hit-me'); if (navigator.vibrate) try { navigator.vibrate(12); } catch (e) {} }
+  const t = inkWrite($('#duel-text'), res.text, { immediate: true, step: 18 });
+  await sleep(Math.min(t, 1500) + 650);
+}
+
+/* ================= 行囊 / 卷首菜单 ================= */
+const sheet = $('#sheet');
+async function openSheet(title, body) {
+  const x = $('#sheet-x'); if (x) x.hidden = true;
+  $('#sheet-title').textContent = title; const sb = $('#sheet-body'); sb.innerHTML = ''; sb.appendChild(body);
+  sheet.hidden = false; await sleep(20); sheet.classList.add('open');
+}
+async function closeSheet() {
+  const x = $('#sheet-x'); if (x) x.hidden = true;
+  sheet.classList.remove('open'); await sleep(500); sheet.hidden = true;
+}
+$('.sheet-shade').onclick = closeSheet;
+const sheetX = $('#sheet-x');
+if (sheetX) sheetX.onclick = () => closeSheet();
+const traceNote = $('#trace-note');
+if (traceNote) traceNote.addEventListener('click', e => {
+  if (e.target.closest('#trace-open')) openTraceSheet();
+});
+function refreshOpenPanel() {
+  const root = $('#sheet-body') && $('#sheet-body').firstElementChild;
+  if (root && typeof root._refresh === 'function') root._refresh();
+}
+function openBag(tab = 'bag') {
+  // 行囊：只装消耗品与佩器；功法／法宝／定型／丹炉改走「修」印 openCult
+  if (tab && tab !== 'bag') return openCult(tab);
+  const wrap = document.createElement('div'); wrap.className = 'bag-wrap';
+  const shopBit = (typeof Redworld !== 'undefined' && Redworld.open(S)) ? '已有铺面 · 休市中' : '尚未开铺';
+  const shopHtml = S.mortal ? '' : `<button type="button" class="bag-shop">${shopBit} · 去铺子</button>`;
+  wrap.innerHTML = `<div class="bag-lead">丹药 · 佩器 · 杂物<span>服用后不关卷</span></div>${shopHtml}<div class="tab-body bag-body"></div>`;
+  const shopBtn = wrap.querySelector('.bag-shop');
+  if (shopBtn) shopBtn.onclick = async () => { await closeSheet(); openShop(); };
+  if (S.village) {
+    const villageButton = document.createElement('button'); villageButton.className = 'bag-shop';
+    villageButton.textContent = '村中旧事 · 镇上差事与温养'; villageButton.onclick = openVillageTasks; wrap.prepend(villageButton);
+  }
+  const body = wrap.querySelector('.tab-body');
+  const show = () => {
+    $('#sheet-title').textContent = '行囊';
+    body.innerHTML = '';
+    body.appendChild(bagPage());
+    body.classList.remove('tab-in'); void body.offsetWidth; body.classList.add('tab-in');
+  };
+  wrap._refresh = show;
+  openSheet('行囊', wrap);
+  show();
+}
+function growthPage() {
+  const view = Growth.view(S), w = document.createElement('div'); w.className = 'growth-page';
+  const lead = document.createElement('p'); lead.className = 'growth-lead'; lead.textContent = view.lead; w.appendChild(lead);
+  const grid = document.createElement('div'); grid.className = 'growth-grid';
+  view.items.forEach(item => {
+    const row = document.createElement('section'); row.className = 'growth-row';
+    const head = document.createElement('div'); head.className = 'growth-row-head';
+    const name = document.createElement('b'); name.textContent = item.name; head.appendChild(name);
+    const value = document.createElement('strong'); value.textContent = item.value; head.appendChild(value); row.appendChild(head);
+    const note = document.createElement('p'); note.textContent = item.note; row.appendChild(note); grid.appendChild(row);
+  });
+  w.appendChild(grid);
+  const conversion = document.createElement('p'); conversion.className = 'growth-conversion'; conversion.textContent = view.conversion; w.appendChild(conversion);
+  if (view.history) {
+    const sec = document.createElement('section'); sec.className = 'growth-history';
+    const title = document.createElement('h3'); title.textContent = view.historyType === 'adult' ? '成年底账' : '童年底账'; sec.appendChild(title);
+    const p = document.createElement('p'), h = view.history;
+    p.textContent = view.historyType === 'adult'
+      ? `学问${h.read} · 职业${h.work}段 · 阅历${h.experience} · 声名${h.renown}`
+      : `识字${h.read} · 手艺${h.craft} · 心性${h.heart} · 人情${h.people}`;
+    sec.appendChild(p); w.appendChild(sec);
+  }
+  return w;
+}
+function openCult(tab = 'gf') {
+  if (S && S.mortal) return openMortalLife();
+  const wrap = document.createElement('div'); wrap.className = 'cult-wrap';
+  const hasDan = typeof JHUI !== 'undefined' && S && S.dan;
+  const tabs = [['gf', '功法'], ['growth', '成长'], ['fabao', '法宝'], ['path', '定型']];
+  if (hasDan) tabs.push(['dan', '丹炉']);
+  wrap.innerHTML = `<div class="sheet-tabs">${tabs.map((t, i) => `${i ? '<i class="stab-dot"></i>' : ''}<button class="stab" data-t="${t[0]}">${t[1]}</button>`).join('')}</div><div class="tab-body"></div>`;
+  const body = wrap.querySelector('.tab-body');
+  const TT = { gf: '功法', growth: '成长', dan: '丹炉', fabao: '法宝', path: '定型' };
+  let cur = tabs.some(t => t[0] === tab) ? tab : 'gf';
+  const show = t => {
+    cur = t;
+    wrap.querySelectorAll('.stab').forEach(b => b.classList.toggle('on', b.dataset.t === t));
+    $('#sheet-title').textContent = TT[t] || '修持';
+    body.innerHTML = '';
+    body.appendChild(t === 'gf' ? gfPage() : t === 'growth' ? growthPage() : t === 'dan' ? JHUI.danPage() : t === 'fabao' ? fabaoPage() : pathPage());
+    body.classList.remove('tab-in'); void body.offsetWidth; body.classList.add('tab-in');
+  };
+  wrap._refresh = () => show(cur);
+  wrap.querySelector('.sheet-tabs').onclick = e => { const b = e.target.closest('.stab'); if (b) show(b.dataset.t); };
+  openSheet(TT[cur] || '修持', wrap);
+  show(cur);
+}
+const PAPER_ITEMS = {
+  '村塾名帖': '六岁入村塾时写下的名帖。姓名、生辰与家中称谓都在上面。',
+  '大黎皇历': '大黎开国皇帝创制并颁行的历法。可翻月、择日，也能回看当日所记。',
+  '吐纳残篇': '由数处旧书与旅人消息拼出的行气法门。读懂之后，可在谋生页尝试入道。',
+  '家中旧物': '前世家中留下的旧物。裹着两枚应急灵石，也提醒你来时仍有人间。',
+  '干粮': '远行时按路程消耗。回家歇息备粮可以补足，最多存十份。'
+};
+function openPaperItem(k) {
+  const wrap = document.createElement('div'); wrap.className = 'paper-item';
+  const p = document.createElement('p'); p.textContent = PAPER_ITEMS[k]; wrap.appendChild(p);
+  if (k === '大黎皇历') wrap.appendChild(Calendar.sheet(S));
+  openSheet(k, wrap);
+}
+function bagPage() {
+  const wrap = document.createElement('div'); wrap.className = 'bag-list';
+  if (S.eq && S.eq.weapon) {
+    const eq = document.createElement('div'); eq.className = 'item eq-row';
+    const gg = GEAR[S.eq.weapon];
+    eq.innerHTML = `<div class="item-info"><div class="item-name">佩身 · ${S.eq.weapon}<em>${gg ? gg.kind : '器'}</em></div><div class="item-desc"></div></div>
+      <div class="item-acts"><button class="item-use" data-act="uneq">卸下</button></div>`;
+    eq.querySelector('.item-desc').textContent = gg ? gg.desc : '';
+    eq.querySelector('[data-act=uneq]').onclick = () => {
+      const r = Core.unequip(S); if (r.err) return toast(r.err);
+      pushLog({ text: r.text, tags: r.tags, cls: 'sys' }); render(); save(); refreshOpenPanel();
+    };
+    wrap.appendChild(eq);
+  }
+  const keys = Object.keys(S.items).filter(k => S.items[k] > 0);
+  if (!keys.length && !(S.eq && S.eq.weapon)) {
+    wrap.insertAdjacentHTML('beforeend', '<div class="empty bag-empty"><b>行囊空空</b><span>唯有清风两袖</span></div>');
+  }
+  keys.forEach(k => {
+    const it = document.createElement('div'); it.className = 'item';
+    const mid = Core.manualId ? Core.manualId(k) : null;
+    if (mid) {
+      const off = Core.manualOffer(S, mid);
+      if (!off) return;
+      it.innerHTML = `<div class="item-info"><div class="item-name"></div><div class="item-desc"></div></div><div class="item-acts"></div>`;
+      const acts = it.querySelector('.item-acts');
+      it.querySelector('.item-name').innerHTML = `《${esc(off.name)}》<em>×${S.items[k]}</em><em class="gear-k">${esc(off.grade)}品</em>`;
+      it.querySelector('.item-desc').textContent = off.cap
+        ? `《${off.name}》已至大成。可售予坊市，换灵石${cn(off.price)}。`
+        : `胸中已有此法，${off.role}第${cn(off.lv)}层。参悟可升至第${cn(off.next)}层，行功自 ×${off.spd.toFixed(2)} 至 ×${off.nextSpd.toFixed(2)}。售予坊市可得灵石${cn(off.price)}。`;
+      const bStudy = document.createElement('button'); bStudy.className = 'item-use'; bStudy.textContent = '参悟精进'; bStudy.disabled = !!off.cap;
+      bStudy.onclick = () => {
+        const r = Core.studyManual(S, mid); if (r.err) return toast(r.err);
+        pushLog({ text: r.text, tags: r.tags, cls: 'gold' }); render(); save(); refreshOpenPanel();
+      };
+      const bSell = document.createElement('button'); bSell.className = 'item-use light'; bSell.textContent = '售予坊市';
+      bSell.onclick = () => {
+        const r = Core.sellManual(S, mid); if (r.err) return toast(r.err);
+        pushLog({ text: r.text, tags: r.tags, cls: 'sys' }); render(); save(); refreshOpenPanel();
+      };
+      acts.appendChild(bStudy); acts.appendChild(bSell);
+      wrap.appendChild(it);
+      return;
+    }
+    const isG = typeof GEAR !== 'undefined' && GEAR[k];
+    const canUse = !!(PILLS[k] && PILLS[k].use) || (k === '延寿丹' || k === '破障丹');
+    it.innerHTML = `<div class="item-info"><div class="item-name"></div><div class="item-desc"></div></div><div class="item-acts"></div>`;
+    it.querySelector('.item-name').innerHTML = `${k}<em>×${S.items[k]}</em>${isG ? `<em class="gear-k">${GEAR[k].kind}</em>` : ''}`;
+    it.querySelector('.item-desc').textContent = PAPER_ITEMS[k] || (isG ? GEAR[k].desc : (Core.itemEffect ? Core.itemEffect(S, k) : (PILLS[k] ? PILLS[k].desc : '')));
+    const acts = it.querySelector('.item-acts');
+    if (PAPER_ITEMS[k]) {
+      const read = document.createElement('button'); read.type = 'button'; read.className = 'item-use'; read.textContent = '翻阅';
+      read.onclick = () => openPaperItem(k); acts.appendChild(read);
+    } else if (canUse) {
+      const cap = Core.useBatchCap ? Core.useBatchCap(S, k) : Math.min(5, S.items[k] | 0);
+      const mk = (lab, n, cls) => {
+        const b = document.createElement('button'); b.className = 'item-use' + (cls ? ' ' + cls : ''); b.textContent = lab;
+        b.disabled = cap <= 0 || (n > 1 && (S.items[k] | 0) < 2);
+        if (n > 1 && n > cap) b.disabled = true;
+        b.onclick = () => {
+          const r = useItem(k, n);
+          if (r) { toast(n > 1 ? `已服 ×${r.used || n}` : '已服用'); refreshOpenPanel(); }
+        };
+        return b;
+      };
+      acts.appendChild(mk('服', 1));
+      if ((S.items[k] | 0) >= 2 && cap >= 2) {
+        const n5 = Math.min(5, cap, S.items[k] | 0);
+        if (n5 >= 2) acts.appendChild(mk('×' + n5, n5, 'batch'));
+      }
+      if ((S.items[k] | 0) > 1 && cap > 1) {
+        const nAll = Math.min(cap, S.items[k] | 0);
+        if (nAll >= 2) acts.appendChild(mk('尽', nAll, 'batch all'));
+      }
+      if (cap <= 0) {
+        const tip = document.createElement('span'); tip.className = 'item-cap-tip';
+        tip.textContent = k === '回春丹' ? '无伤' : k === '清心丹' ? '心境已满' : k === '聚气丹' ? '瓶颈无益' : '暂不可服';
+        acts.appendChild(tip);
+      }
+    } else if (isG) {
+      const b = document.createElement('button'); b.className = 'item-use'; b.textContent = '佩戴';
+      b.onclick = () => {
+        const r = Core.equip(S, k); if (r.err) return toast(r.err);
+        pushLog({ text: r.text, tags: r.tags, cls: r.tags.some(t => t.c === 'down') ? 'warn' : 'sys' });
+        render(); save(); refreshOpenPanel();
+      };
+      acts.appendChild(b);
+    }
+    wrap.appendChild(it);
+  });
+  if (typeof SHENQI_ZHI !== 'undefined') {
+    const zhi = document.createElement('div'); zhi.className = 'shenqi-zhi';
+    const known = SHENQI_ZHI.filter(z => (S.flags && S.flags[z.flag]) || (S.items && S.items[z.name]) || (S.eq && S.eq.weapon === z.name));
+    const rows = known.map(z => `<div class="sq-row on"><span class="sq-seal">${esc(z.seal)}</span><div><b>${esc(z.name)}</b><p>${esc(z.blurb)}</p></div></div>`).join('');
+    const missing = SHENQI_ZHI.length - known.length;
+    const blank = missing ? `<p class="sq-unseen">${known.length ? '其余' + cn(missing) + '件，机缘未至。' : '神器尚未遇见，名录空着。'}</p>` : '';
+    zhi.innerHTML = `<div class="sq-h"><span>神器志</span><em>奇遇见过或持有后解锁</em></div>${rows}${blank}`;
+    wrap.appendChild(zhi);
+  }
+  return wrap;
+}
+
+const layerDots = lv => Array.from({ length: GF_LAYERS }, (_, i) => `<i class="${i < lv ? 'on' : ''}"></i>`).join('');
+const gfElWord = (id) => { const g = GONGFA[id]; return (g.el ? (g.el === '五行' ? '五行' : g.el + '行') : '无属') + ' · ' + (g.style ? GF_STYLE[g.style] + '流 · ' : '') + Core.gfMatchWord(S, id); };
+function gfPage() {
+  const wrap = document.createElement('div'); wrap.className = 'gf-page';
+  // 主修
+  const mainBox = document.createElement('div'); mainBox.className = 'gf-block';
+  mainBox.innerHTML = '<div class="gf-list-h"><span>主修</span><em>一门</em></div>';
+  wrap.appendChild(mainBox);
+  if (!S.gf) {
+    mainBox.insertAdjacentHTML('beforeend', `<div class="gf-scroll gf-none"><div class="gf-vname">${[...'无法可依'].map(c => `<i>${c}</i>`).join('')}</div>
+      <div class="gf-info"><p class="gf-desc">胸中尚无一部功法。你只凭本能吐纳，像在夜里摸索山路——走得动，却走不快。</p>
+      <div class="gf-speed">行功之速 <b>×${K.noGf.toFixed(2)}</b></div><div class="gf-src">游历、宗门、坊市，皆可遇得功法。</div></div></div>`);
+  } else {
+    const g0 = GONGFA[S.gf], e = S.gfs[S.gf];
+    const card = document.createElement('div'); card.className = 'gf-scroll g' + g0.grade + (g0.mo ? ' mo' : '') + ' main';
+    card.innerHTML = `<div class="gf-vname">${[...g0.name].map(c => `<i>${c}</i>`).join('')}</div>
+      <div class="gf-info">
+        <div class="gf-meta"><span class="gf-seal">${GF_GRADE[g0.grade]}</span><span class="gf-el">${gfElWord(S.gf)}</span><span class="gf-role">主修</span></div>
+        <div class="gf-layers">${layerDots(e.lv)}<em>${e.lv >= GF_LAYERS ? '大成' : '第' + cn(e.lv) + '层'}</em></div>
+        <div class="gf-speed">行功之速 <b>×${Core.gfSpeed(S).toFixed(2)}</b></div>
+        <div class="gf-deep">额外加成 ×${Core.gfExtra(S).toFixed(2)}，上限 ${S.gf === 'tianmo' ? '1.75' : '1.40'}；品阶、层数与灵根另计。</div>
+        ${e.lv > 1 ? `<div class="gf-deep">第${cn(e.lv)}层。层数愈高，每一层加进行功的分量愈淡。</div>` : ''}
+        <div class="gf-trait">${g0.trait}</div>
+        <p class="gf-desc"></p>
+        <div class="gf-src">得自 · ${g0.src}</div>
+      </div>`;
+    card.querySelector('.gf-desc').textContent = g0.desc;
+    mainBox.appendChild(card);
+  }
+  // 辅修
+  const auxBox = document.createElement('div'); auxBox.className = 'gf-block';
+  const aux = S.aux || [];
+  auxBox.innerHTML = `<div class="gf-list-h"><span>辅修</span><em>${cn(aux.length)}/${cn(typeof AUX_MAX !== 'undefined' ? AUX_MAX : 2)} · 只取其意</em></div>`;
+  wrap.appendChild(auxBox);
+  if (!aux.length) {
+    const em = document.createElement('div'); em.className = 'empty small'; em.textContent = '尚未辅修 · 可自胸中所藏择一两门温养'; auxBox.appendChild(em);
+  } else aux.forEach(id => {
+    const g0 = GONGFA[id], e = S.gfs[id];
+    const row = document.createElement('div'); row.className = 'gf-row aux g' + g0.grade;
+    row.innerHTML = `<span class="gf-seal">${GF_GRADE[g0.grade]}</span>
+      <div class="gf-row-info"><div class="gf-row-name">${g0.name}<em>辅 · ${e.lv >= GF_LAYERS ? '大成' : cn(e.lv) + '层'}</em></div>
+      <div class="gf-row-sub">${gfElWord(id)} · ${g0.trait}${Core.auxRelation(S, id) === 'ke' ? ' · 与主修相悖：正面速度不生效' : Core.auxRelation(S, id) === 'sheng' ? ' · 相生：伤愈、养心多取一半，无额外速度' : ''}${e.broken ? ' · 残篇不生效' : ''}</div></div>
+      <button class="item-use">卸下</button>`;
+    row.querySelector('button').onclick = () => {
+      const r = Core.clearAux(S, id);
+      pushLog({ text: r.text, tags: r.tags, cls: 'sys' }); render(); save(); refreshOpenPanel();
+    };
+    auxBox.appendChild(row);
+  });
+  // 所藏
+  const others = Object.keys(S.gfs).filter(id => id !== S.gf);
+  const h = document.createElement('div'); h.className = 'gf-list-h'; h.innerHTML = `<span>胸中所藏</span><em>${cn(Object.keys(S.gfs).length)}部</em>`;
+  wrap.appendChild(h);
+  if (!others.length) { const em = document.createElement('div'); em.className = 'empty small'; em.textContent = '别无他法 · 机缘未至'; wrap.appendChild(em); }
+  others.sort((a, b) => GONGFA[b].grade - GONGFA[a].grade).forEach(id => {
+    const g0 = GONGFA[id], e = S.gfs[id], isAux = aux.includes(id);
+    const row = document.createElement('div'); row.className = 'gf-row g' + g0.grade + (g0.mo ? ' mo' : '');
+    row.innerHTML = `<span class="gf-seal">${GF_GRADE[g0.grade]}</span>
+      <div class="gf-row-info"><div class="gf-row-name">${g0.name}<em>${e.lv >= GF_LAYERS ? '大成' : cn(e.lv) + '层'}</em></div>
+      <div class="gf-row-sub">${e.broken ? '残篇未补 · 转修之后才走这条路 · ' : ''}${gfElWord(id)} · ×${Core.gfSpeed(S, id).toFixed(2)}</div><div class="gf-row-trait">${g0.trait}</div>
+      <div class="gf-cost">${(c => `散功转修：${c.lose ? `修为 −${fmtNum(c.lose)} · ` : ''}心境 −${c.xj} · 耗时${cnDur(c.duration)}${c.extra ? `（修为不足，以${cnDur(c.extraDuration)}苦功补足）` : ''}${c.layer ? ` · 《${GONGFA[S.gf].name}》跌一层` : ''}`)(Core.switchCost(S, id))}</div></div>
+      <div class="gf-acts"></div>`;
+    const acts = row.querySelector('.gf-acts');
+    const bMain = document.createElement('button'); bMain.className = 'item-use'; bMain.textContent = '转修';
+    bMain.onclick = async () => {
+      if (!row.classList.contains('confirm')) { wrap.querySelectorAll('.gf-row.confirm').forEach(r => { r.classList.remove('confirm'); const bb = r.querySelector('.item-use'); if (bb && bb.textContent === '确定') bb.textContent = '转修'; }); row.classList.add('confirm'); bMain.textContent = '确定'; return; }
+      await closeSheet();
+      Core.switchGf(S, id, pushLog); render(); save(); checkEnd();
+    };
+    acts.appendChild(bMain);
+    if (!isAux && id !== 'tianmo' && !(id === 'buken' && S.gf === 'tianmo') && aux.length < (typeof AUX_MAX !== 'undefined' ? AUX_MAX : 2)) {
+      const bAux = document.createElement('button'); bAux.className = 'item-use light'; bAux.textContent = '辅修';
+      bAux.onclick = () => {
+        const r = Core.setAux(S, id); if (r.err) return toast(r.err);
+        pushLog({ text: r.text, tags: r.tags, cls: 'sys' }); render(); save(); refreshOpenPanel();
+      };
+      acts.appendChild(bAux);
+    }
+    wrap.appendChild(row);
+  });
+  return wrap;
+}
+function fabaoPage() {
+  const wrap = document.createElement('div'); wrap.className = 'fabao-page';
+  if (!S.fabao) {
+    wrap.innerHTML = `<div class="fabao-scroll empty-fabao">
+      <div class="fabao-seal">空</div>
+      <p class="fabao-title">本命未认</p>
+      <p class="fabao-flavor">器随人走，人未至，器不来。破境筑基之后，自有一物落于识海——与你灵根相应，与你主修相系。</p>
+      <p class="fabao-hint">筑基成功时认主 · 吐纳／闭关／游历／破境可祭炼<br>器基道基者，祭炼倍加亲近</p>
+    </div>`;
+    if (S.flags && S.flags.fabaoCanhun) wrap.insertAdjacentHTML('beforeend', '<p class="fabao-canhun">残魂未散 · 来世或可重光</p>');
+    return wrap;
+  }
+  const f = S.fabao, st = f.stage | 0, need = typeof FABAO_NEED !== 'undefined' ? FABAO_NEED : [0, 10, 28, 64];
+  const next = st < 3 ? need[st + 1] : null;
+  const bonus = (typeof FABAO_BONUS !== 'undefined' ? FABAO_BONUS[st] : {}) || {};
+  const traits = [];
+  if (bonus.bt) traits.push('破境 +' + Math.round(bonus.bt * 100) + '%');
+  if (bonus.spd) traits.push('行功 ×' + bonus.spd.toFixed(2));
+  if (bonus.life) traits.push('寿元 +' + Math.round(bonus.life * 100) + '%');
+  if (bonus.qiyu) traits.push('机缘略增');
+  const card = document.createElement('div'); card.className = 'fabao-scroll stage-' + st;
+  card.innerHTML = `
+    <div class="fabao-head"><span class="fabao-seal">${f.seal || '器'}</span>
+      <div><b class="fabao-name">${f.name}</b><span class="fabao-stage">${typeof FABAO_STAGE !== 'undefined' ? FABAO_STAGE[st] : ''}</span></div></div>
+    <p class="fabao-flavor"></p>
+    <div class="fabao-bond"><span>祭炼</span><span class="fb-track"><i style="width:${next ? Math.min(100, f.bond / next * 100) : 100}%"></i></span>
+      <em>${next ? cn(f.bond) + ' / ' + cn(next) : '化形已成'}</em></div>
+    <div class="fabao-traits">${traits.length ? traits.map(t => '<span>' + t + '</span>').join('') : '<span>认主之初，灵性尚浅</span>'}</div>
+    <div class="fabao-meta">系于 · ${f.el || '无属'}灵根${f.gfId && GONGFA[f.gfId] ? ' · 《' + GONGFA[f.gfId].name + '》' : ''}</div>`;
+  card.querySelector('.fabao-flavor').textContent = f.flavor || '';
+  wrap.appendChild(card);
+  if (typeof FabaoArt !== 'undefined' && FabaoArt.mountCard) FabaoArt.mountCard(card, f);
+  wrap.insertAdjacentHTML('beforeend', `<p class="fabao-note">转主修或身死，或留残魂供来世再聚。法宝不入行囊，只在识海。祭炼进阶时，识海自有开光／化形之礼。</p>`);
+  return wrap;
+}
+function useItem(k, n) {
+  const o = Core.useItem(S, k, n);
+  if (o.err) { toast(o.err); return null; }
+  pushLog({ text: o.text, tags: o.tags, cls: 'sys' }); Core.afterGain(S, o.ups, pushLog); render(); save(); checkEnd();
+  return o;
+}
+function returnToTitle() {
+  if (busy || !S || document.body.classList.contains('paper-turning')) return;
+  save(); initTitle(); unrollTo('title');
+}
+function openMenu() {
+  const w = document.createElement('div'); w.className = 'menu-list';
+  const ps = (Core.pathSummary(S) || []).map(x => x.name).join(' · ') || '道基未定';
+  const ds = (typeof Samsara !== 'undefined') ? Samsara.dailyStatus() : { claimed: true };
+  const trialNote = (S.flags && S.flags.trial) ? '<br><span class="menu-trial">试炼境 · 不入轮回簿</span>' : '';
+  w.innerHTML = `<div class="menu-note">${S.name} · ${realmStr()} · ${cn(S.age)}岁<br>定型 · ${ps}${trialNote}<br>此卷随笔随存，合上亦不失。</div>
+    <button class="menu-item" data-m="shop">铺子<small>开铺 · 上货 · 一季一结</small></button>
+    <button class="menu-item" data-m="sex">此身<small>称呼 · 道侣心意</small></button>
+    <button class="menu-item" data-m="trace">行迹<small>因果 · 此生印记</small></button>
+    <button class="menu-item" data-m="annals">平生<small>逐年 · 所遇 · 所求</small></button>
+    <button class="menu-item" data-m="look">纸墨<small>昼夜 · 字号 · 动效</small></button>
+    <button class="menu-item" data-m="resume">继续修行</button>
+    <button class="menu-item" data-m="slots">存档<small>六卷 · 导出 · 导入</small></button>
+    <button class="menu-item" data-m="path">定型小记<small>道基 · 丹纹 · 法相</small></button>
+    <button class="menu-item" data-m="atlas">轮回图鉴<small>墓志 · 道基 · 法相 · 神器 · 结局</small></button>
+    ${!ds.claimed ? '<button class="menu-item" data-m="daily">今日机缘<small>晨露一缕</small></button>' : ''}
+    <button class="menu-item" data-m="title">回到卷首</button>
+    ${Core.canRetire(S) ? '<button class="menu-item" data-m="retire">归隐山林<small>放下长生，此卷即终</small></button>' : ''}
+    <button class="menu-item danger" data-m="reset">焚卷重来</button>`;
+  w.onclick = async e => {
+    const btn = e.target.closest('[data-m]'); if (!btn) return;
+    const m = btn.dataset.m;
+    if (m === 'slots') { await closeSheet(); openSlots(); return; }
+    if (m === 'trace') { await closeSheet(); openTraceSheet(); return; }
+    if (m === 'annals') { await closeSheet(); openAnnals(); return; }
+    if (m === 'shop') { await closeSheet(); openShop(); return; }
+    if (m === 'sex') { await closeSheet(); openSexSheet(); return; }
+    if (m === 'look') { await closeSheet(); openLook(); return; }
+    if (m === 'path') { await closeSheet(); openCult('path'); return; }
+    if (m === 'atlas') { await closeSheet(); openAtlasSheet(); return; }
+    if (m === 'daily') {
+      await closeSheet();
+      const r = Samsara.claimDaily(S, pushLog);
+      if (r.err) toast(r.err); else { save(); render(); toast('日缘已领'); }
+      return;
+    }
+    await closeSheet();
+    if (m === 'title') returnToTitle();
+    if (m === 'retire' && await inkConfirm('此去不问长生。归隐之后，此卷即终。', '归隐')) {
+      Core.retire(S); pushLog({ title: '归隐', text: '你解下腰牌，放在洞府石案上，转身下山。山道上的石阶，你走了许多年，今日才觉出它这样长。', cls: 'event', div: true });
+      render(); save(); setTimeout(() => showEnd('guiyin'), 900);
+    }
+    if (m === 'reset' && await inkConfirm('焚去此卷，前尘尽忘。', '焚卷', true)) {
+      const reset = () => {
+        if (typeof Slots !== 'undefined') Slots.clear(Slots.loadBox().active);
+        else localStorage.removeItem(SAVE_KEY);
+        S = null; clearOpeningSex(); resetCreate(); unrollTo('create');
+      };
+      let meta;
+      try {
+        meta = typeof Samsara !== 'undefined' ? Samsara.loadMeta(true)
+          : JSON.parse((typeof Slots !== 'undefined' ? Slots.readEffect('moxian.meta') : localStorage.getItem('moxian.meta')) || '{}');
+      } catch (err) { toast('开卷未成，请稍后重试'); return; }
+      if (meta.bridge && meta.bridge.open) openNaihe(reset);
+      else reset();
+    }
+  };
+  openSheet('卷首', w);
+}
+
+
+/* ================= 六卷存档 ================= */
+const END_NAME = { ascend: '飞升', hongchen: '红尘仙', zuohua: '坐化', fanren: '凡尘', rumo: '入魔', guiyin: '归隐', bingjie: '兵解', yunluo: '身殒', renhuang: '人皇', quancheng: '权臣', huashen: '山神', zhenmo: '镇魔', chuanshuo: '传说' };
+function openSlots() {
+  if (typeof Slots === 'undefined') { toast('存档未备'); return; }
+  const w = document.createElement('div');
+  w.className = 'slot-sheet';
+  let sel = Slots.loadBox().active | 0;
+  const paint = () => {
+    const box = Slots.loadBox();
+    if (sel < 0 || sel >= Slots.N) sel = box.active | 0;
+    const cards = box.slots.map((sl, i) => {
+      if (!sl || !sl.sum) return `<button type="button" class="slot-card empty${i === sel ? ' on' : ''}" data-i="${i}"><b>第${cn(i + 1)}卷</b><em>空卷</em><small>可存入</small></button>`;
+      const sm = sl.data ? Slots.summarize(sl.data) : sl.sum;
+      const st = sm.ascended ? '飞升' : sm.dead ? (END_NAME[sm.ending] || '已终') : '在修';
+      return `<button type="button" class="slot-card${i === sel ? ' on' : ''}" data-i="${i}"><b>${esc(sm.name || '无名')}</b><em>${esc(sm.realmName || '—')} · ${cn(sm.age || 0)}岁</em><small>${esc(Slots.fmtPlayed(sm.played))} · ${esc(Slots.fmtDate(sl.at))} · ${esc(st)}</small></button>`;
+    }).join('');
+    const io = w.querySelector('.slot-io');
+    const keep = io && !io.hidden ? io.innerHTML : '';
+    const keepOn = io && !io.hidden;
+    const selected = box.slots[sel] && box.slots[sel].data;
+    const endedTrial = selected && selected.flags && selected.flags.trial && (selected.dead || selected.ascended);
+    w.innerHTML = `<p class="slot-lead">六卷并存。读入即续，存入即覆。导出的码可抄去别处。</p>
+      <div class="slot-list">${cards}</div>
+      <div class="slot-actions">
+        <button type="button" class="menu-item" data-a="load">${endedTrial ? '查看试炼' : '读入此卷'}</button>
+        ${S && !S.dead && !S.ascended ? '<button type="button" class="menu-item" data-a="save">存入此卷</button>' : ''}
+        <button type="button" class="menu-item" data-a="export">导出此卷</button>
+        <button type="button" class="menu-item" data-a="import">导入存档</button>
+        <button type="button" class="menu-item danger" data-a="wipe">焚去此卷</button>
+      </div>
+      <div class="slot-io"${keepOn ? '' : ' hidden'}>${keep}</div>`;
+  };
+  const slotData = i => {
+    const box = Slots.loadBox();
+    const sl = box.slots[i];
+    if (!sl) return null;
+    return Slots.migrateSlot(sl);
+  };
+  w.addEventListener('click', async e => {
+    const card = e.target.closest('.slot-card');
+    if (card) { sel = +card.dataset.i; paint(); return; }
+    const b = e.target.closest('[data-a]');
+    if (!b || b.closest('.slot-io')) return;
+    const a = b.dataset.a;
+    if (a === 'load') {
+      const data = slotData(sel);
+      if (!data) { toast('此卷是空的'); return; }
+      if ((data.dead || data.ascended) && !(data.flags && data.flags.trial)) { toast('此卷已终，可导出，不能续'); return; }
+      if (S && !S.dead && !(await inkConfirm('转去另一卷？当前卷已随手存好。', '读入'))) return;
+      if (S && save() === false) { toast('存档未写入，请稍后重试'); return; }
+      // Read the selected snapshot, not a slot that save() may just have overwritten.
+      if (!Slots.write(sel, data)) { toast('存档未写入，请稍后重试'); return; }
+      S = data;
+      if (!S) { toast('此卷读不开'); return; }
+      playTick = Date.now();
+      await closeSheet();
+      $('#end').hidden = true;
+      enterMain(true);
+      return;
+    }
+    if (a === 'save') {
+      if (!S || S.dead || S.ascended) { toast('没有可存的卷'); return; }
+      const box = Slots.loadBox();
+      if (box.slots[sel] && sel !== box.active && !(await inkConfirm('覆上这一卷？', '存入', true))) return;
+      if (!Slots.write(sel, S)) { toast('存档未写入，请稍后重试'); return; }
+      toast('已存入第' + cn(sel + 1) + '卷');
+      paint();
+      return;
+    }
+    if (a === 'export') {
+      const data = slotData(sel) || (S && sel === (Slots.loadBox().active | 0) ? S : null);
+      if (!data) { toast('此卷是空的'); return; }
+      let code = '';
+      try { code = Codec.encode(data); } catch (err) { toast('导出未成'); return; }
+      const io = document.createElement('div');
+      io.className = 'slot-io';
+      io.innerHTML = `<p>长按可复制。换一处设备，用「导入」贴回。</p><textarea class="slot-code" readonly></textarea><button type="button" class="menu-item" data-a="copy">复制</button>`;
+      io.querySelector('textarea').value = code;
+      const old = w.querySelector('.slot-io');
+      if (old) old.replaceWith(io); else w.appendChild(io);
+      io.querySelector('[data-a="copy"]').onclick = async () => {
+        const ta = io.querySelector('textarea');
+        ta.focus(); ta.select();
+        try { await navigator.clipboard.writeText(code); toast('已抄下'); }
+        catch (err) { toast('请长按文字复制'); }
+      };
+      return;
+    }
+    if (a === 'import') {
+      const io = document.createElement('div');
+      io.className = 'slot-io';
+      io.innerHTML = `<p>把存档码贴在下面。将写入第${cn(sel + 1)}卷。</p><textarea class="slot-code" placeholder="MX1.…"></textarea><button type="button" class="menu-item" data-a="doimp">验入</button>`;
+      const old = w.querySelector('.slot-io');
+      if (old) old.replaceWith(io); else w.appendChild(io);
+      io.querySelector('[data-a="doimp"]').onclick = async () => {
+        const text = io.querySelector('textarea').value;
+        const dec = Codec.decode(text);
+        if (dec.err) { toast(dec.err); return; }
+        let data = dec.data;
+        if (data && data.data && data.data.v && !data.v) data = data.data;
+        data = Core.migrate(data);
+        if (!data || !data.name) { toast('此码不是一卷可续的人生'); return; }
+        const box = Slots.loadBox();
+        if (box.slots[sel] && !(await inkConfirm(`写入第${cn(sel + 1)}卷，原卷将被盖住。`, '导入', true))) return;
+        if (!Slots.write(sel, data)) { toast('存档未写入，请稍后重试'); return; }
+        toast('已导入 · ' + data.name);
+        // Replacing the active scroll ends the in-memory life too: visibility/unload
+        // autosaves must not write that old life over the imported snapshot.
+        if (S && (box.active | 0) === sel) {
+          S = null;
+          await closeSheet();
+          initTitle(); unrollTo('title');
+          return;
+        }
+        paint();
+      };
+      return;
+    }
+    if (a === 'wipe') {
+      const box = Slots.loadBox();
+      if (!box.slots[sel]) { toast('此卷是空的'); return; }
+      if (!(await inkConfirm('焚去这一卷？', '焚卷', true))) return;
+      const wasActive = (box.active | 0) === sel;
+      Slots.clear(sel);
+      if (wasActive && S) { S = null; }
+      toast('已焚');
+      paint();
+      if (wasActive) {
+        initTitle();
+        if (document.body.dataset.screen === 'main') { await closeSheet(); unrollTo('title'); }
+      }
+    }
+  });
+  paint();
+  openSheet('存档', w);
+}
+
+/* ================= 仙途志 / 奈何 ================= */
+const END_BOOK = {
+  hongchen: { name: '红尘仙', hint: '天门开着，有人却留下了。', note: '入世修行，终得正果。世人称红尘仙。' },
+  ascend: { name: '飞升', hint: '白日里，满山的松忽然不响。', note: '此世已毕，可开下一世。' },
+  zuohua: { name: '坐化', hint: '石门开着，案上的笔停在半行。', note: '山风过石门，案上笔未干。' },
+  rumo: { name: '入魔', hint: '有人眼里只剩一种颜色。', note: '墨落成血，不可复洗。' },
+  guiyin: { name: '归隐', hint: '江心多过一条不系饵的船。', note: '空船自横，钓丝无饵。' },
+  bingjie: { name: '兵解', hint: '肉身散了，有一缕还不肯散。', note: '真灵一缕，尚在轮回。' },
+  yunluo: { name: '身殒', hint: '碑上没有字，草却一年比一年高。', note: '无字碑前，野草年年。' },
+  renhuang: { name: '人皇', hint: '山门的钟，有一天一起哑了。', note: '仙凡一统，山门钟哑。' },
+  quancheng: { name: '权臣', hint: '史书不敢写下一个名字。', note: '摄政如天，史不敢名。' },
+  huashen: { name: '山神', hint: '没有门的祠前，风会替人点头。', note: '祠前无门，风替人点头。' },
+  zhenmo: { name: '镇魔', hint: '有人把剑横在膝上，当作镇纸。', note: '裂口合拢，剑作镇纸。' },
+  chuanshuo: { name: '传说', hint: '石室里有一本没有封面的册子。', note: '册子无名，句子还在。' },
+};
+const PERSON_BOOK = {
+  shifu: { name: '玄微真人', hint: '峰顶有人煮茶，茶是留给后辈的。', note: '茶案上多一只杯，是留给你的。' },
+  lu: { name: '陆沉舟', hint: '有个剑修，很少把同辈放在眼里。', note: '同辈之中，你是他唯一想赢的人。' },
+  su: { name: '苏晚晴', hint: '袖口总有一点药香。', note: '她记得你上回的伤好了没有。' },
+  wen: { name: '温庭玉', hint: '笑得很温，扇骨却是冷的。', note: '这样的人，竟也会记一笔人情。' },
+  shi: { name: '石小满', hint: '饭量很大，认死理。', note: '逢人便说，他认得一个天下第一好的人。' },
+  bai: { name: '江疏白', hint: '桥上有人撑伞，话很少。', note: '一程可以。再远的，走着看。' },
+  xie: { name: '谢疏影', hint: '溪边有一把纸伞，看人走路。', note: '案上多一只杯，空的时候也像在等。' },
+};
+const FB_HINT = {
+  '噬主骨刃': '白骨祭坛上，有一件会认主的短东西。',
+  '忘川灯': '有一盏灯，照见来路，不照前路。',
+  '裂空绫': '有一匹很薄的丝，抖开时空间会裂。',
+  '子午罗盘': '有一面盘，指针不指眼前。',
+  '九婴骨笛': '有一支吹不响的笛，夜里却有人应。',
+  '沉渊砚': '有一方砚，池子像未干的夜。',
+};
+const CODEX_REWARD = {
+  ending: '此卷已齐。出身「桥边人」可在开卷时选。不加修为。',
+  gongfa: '此卷已齐。卷色「松烟」可换。只改纸色。',
+  fabao: '此卷已齐。卷色「冷金」可换。只改纸色。',
+  person: '此卷已齐。出身「旧识」可在开卷时选。不加修为。',
+  encounter: '此卷已齐。卷色「雨青」可换。只改纸色。',
+};
+const CODEX_TABS = [['ending', '结局'], ['gongfa', '功法'], ['fabao', '法宝'], ['person', '人物'], ['encounter', '奇遇']];
+function gfHintLine(g) {
+  if (!g) return '还有一本没被你遇见的册子。';
+  if (g.mo) return '页边发暗，像会反过来读人。';
+  const depth = ['薄薄一册', '读来顺手的一卷', '压在箱底的一部', '不该轻易摊开的一篇'][g.grade] || '一册';
+  const el = g.el ? ('字里有' + g.el + '的意思') : '不挑五行';
+  return depth + '，' + el + '。';
+}
+function openNaihe(done) {
+  const cancel = arguments[1];
+  const box = $('#naihe');
+  const fail = () => { if (cancel) cancel(); toast('开卷未成，请稍后重试'); };
+  let b;
+  try {
+    const meta = typeof Samsara !== 'undefined' ? Samsara.loadMeta(true) : JSON.parse(Slots.readEffect('moxian.meta') || '{}');
+    b = meta.bridge;
+    if (!b || !b.open) { return Promise.resolve(done && done()).catch(fail); }
+    if (!box || typeof Samsara === 'undefined' || !Samsara.chooseNaihe) throw Error('bridge unavailable');
+  } catch (e) { fail(); return; }
+  // Reopening replaces the previous callbacks; stale buttons cannot complete a new sheet.
+  const session = {};
+  box._naiheSession = session;
+  let finished = false;
+  const active = () => !finished && box._naiheSession === session;
+  const finish = async () => {
+    finished = true; box.hidden = true;
+    try { if (done) await done(); } catch (e) { fail(); }
+  };
+  const lead = $('#naihe-lead');
+  const opts = $('#naihe-opts');
+  if (lead) {
+    const first = (b.lives | 0) === 1;
+    lead.textContent = (first ? '第一世已尽。桥上只许带一样。带了，下世开卷会略有不同；不带，也干净。' : '此生已了。过桥时，只许带一样。')
+      + (b.name ? '「' + b.name + '」停在这里。' : '');
+  }
+  if (opts) {
+    opts.innerHTML = '';
+    const add = (kind, seal, title, prose, personId) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'naihe-opt';
+      btn.innerHTML = '<span class="naihe-seal"></span><span class="naihe-body"><b></b><em></em></span>';
+      btn.querySelector('.naihe-seal').textContent = seal;
+      btn.querySelector('b').textContent = title;
+      btn.querySelector('em').textContent = prose;
+      btn.onclick = async () => {
+        if (!active()) return;
+        try {
+          Samsara.chooseNaihe(kind, personId, true);
+          await finish();
+        } catch (e) { toast('开卷未成，请稍后重试'); }
+      };
+      opts.appendChild(btn);
+    };
+    const mem = b.mem || {};
+    add('mem', '忆', '一缕记忆', mem.el ? ('有些道理像在骨头里。下世悟性深一寸，灵根微微偏向' + mem.el + '，不是换一条根。') : '有些道理像在骨头里。下世悟性深一寸。');
+    if (b.page && b.page.name) add('page', '残', '一卷残篇', '《' + b.page.name + '》只剩残页。下世它在胸中，不成主修，要等你自己转修。');
+    if (b.bond && b.bond.name) {
+      const role = b.bond.role === 'mate' ? '道侣' : b.bond.role === 'foe' ? '仇人' : '恩人';
+      add('bond', '缘', '一段因果', role + '「' + b.bond.name + '」。下世若还有缘，会再遇见这个人。');
+    }
+    if (b.home) add('home', '家', '家中旧物', '一册旧历、一枚名帖和两枚应急灵石。下一世仍从人间开始。');
+    (b.roadBonds || []).forEach(p => add('bond', '缘', '记住' + p.name, '一段路上因果。下世仍认这个名字，只重逢，不带修为与属性。', p.id));
+    add('none', '空', '什么都不带', '把这一世放下。桥下的水不记名字。');
+  }
+  const back = document.createElement('button');
+  back.type = 'button'; back.className = 'naihe-opt'; back.textContent = '返回';
+  back.onclick = () => {
+    if (!active()) return;
+    finished = true; box.hidden = true;
+    if (cancel) cancel();
+  };
+  if (opts) opts.appendChild(back);
+  box.hidden = false;
+}
+function openAtlasSheet(startTab) {
+  if (typeof Samsara === 'undefined') { toast('仙途志未启'); return; }
+  if (S && Samsara.harvest) {
+    const m0 = Samsara.loadMeta();
+    Samsara.harvest(m0, S);
+    Samsara.saveMeta(m0);
+  }
+  const w = document.createElement('div');
+  w.className = 'codex';
+  let cur = startTab || 'ending';
+  const vague = ['路上还会遇见的一件事。', '纸边还空着一笔。', '你走过，却没有记住。', '风里有一句没听清的话。', '某处的门还关着。'];
+  const SIL_SVG = {
+    stele: '<svg viewBox="0 0 40 64" aria-hidden="true"><path fill="currentColor" d="M20 1l14 9h-5v34h9v8H2v-8h9V10H6z"/></svg>',
+    book: '<svg viewBox="0 0 64 48" aria-hidden="true"><path fill="currentColor" d="M6 10c8-4 16-4 24 0v30c-8-4-16-4-24 0V10z"/><path fill="currentColor" opacity=".5" d="M34 10c8-4 16-4 26 0v30c-10-4-18-4-26 0V10z"/><path fill="currentColor" d="M30 8h4v34h-4z"/></svg>',
+    qi: '<svg viewBox="0 0 64 64" aria-hidden="true"><path fill="currentColor" d="M2 22h12v8H2zm48 0h12v8H50zM12 16h40v6H12zM18 22h28v14c0 11-6 16-14 16s-14-5-14-16V22zM20 52h7v9h-7zm17 0h7v9h-7z"/></svg>',
+    face: '<svg viewBox="0 0 64 72" aria-hidden="true"><g fill="currentColor"><circle cx="18" cy="16" r="6.5"/><circle cx="32" cy="24" r="13"/><circle cx="44.5" cy="26" r="3.2"/><path d="M26 35h11v11H26z"/><path d="M4 70c7-16 16-22 26-22h6c12 0 20 6 26 22z"/></g></svg>',
+    door: '<svg viewBox="0 0 48 64" aria-hidden="true"><path fill="currentColor" fill-rule="evenodd" d="M4 8h40v50H4V8zm10 16a10 14 0 0 1 20 0v34H14V24z"/></svg>',
+  };
+  const sil = kind => `<span class="sil-ink sil-${kind}">${SIL_SVG[kind] || ''}</span>`;
+  const card = (on, art, title, line) => `<article class="codex-card${on ? ' on' : ' sil'}">${art}<div class="codex-copy"><b>${esc(on ? title : '未录')}</b><em>${esc(line)}</em></div></article>`;
+  const seenFirst = parts => {
+    const on = [], off = [];
+    parts.forEach(p => (p.on ? on : off).push(p));
+    let html = on.map(p => card(true, p.art, p.title, p.line)).join('');
+    if (off.length) html += `<p class="codex-unseen">${on.length ? '其余' + cn(off.length) + '处，尚未录入。' : '此处尚未录入。'}</p>`;
+    return html;
+  };
+  function entries(m, tab) {
+    const a = m.atlas || {};
+    if (tab === 'ending') {
+      return Object.keys(END_BOOK).map(id => {
+        const book = END_BOOK[id];
+        const on = !!(a.ending && a.ending[id]);
+        const art = on && typeof END_ART !== 'undefined' && END_ART[id] ? `<div class="codex-art">${END_ART[id]}</div>` : `<div class="codex-art sil-art">${sil('stele')}</div>`;
+        return card(on, art, book.name, on ? book.note : book.hint);
+      }).join('');
+    }
+    if (tab === 'gongfa' && typeof GONGFA !== 'undefined') {
+      return Object.keys(GONGFA).map((id, i) => {
+        const g = GONGFA[id];
+        const on = !!(a.gongfa && a.gongfa[id]);
+        const art = on ? `<div class="codex-art seal-art"><b>${esc(GF_GRADE[g.grade] || '法')}</b></div>` : `<div class="codex-art sil-art">${sil('book')}</div>`;
+        return card(on, art, g.name, on ? (g.trait || '此法已入志。') : gfHintLine(g));
+      }).join('');
+    }
+    if (tab === 'fabao' && typeof SHENQI_ZHI !== 'undefined') {
+      return seenFirst(SHENQI_ZHI.map(z => {
+        const on = !!(a.shenqi && a.shenqi[z.name]);
+        return { on, art: `<div class="codex-art seal-art"><b>${esc(z.seal || '器')}</b></div>`, title: z.name, line: z.blurb || '此器已入志。' };
+      }));
+    }
+    if (tab === 'person') {
+      const ids = (Samsara.PERSON_IDS || Object.keys(PERSON_BOOK));
+      return seenFirst(ids.map(id => {
+        const npc = typeof NPCS !== 'undefined' ? NPCS[id] : null;
+        const book = PERSON_BOOK[id] || { name: npc ? npc.name : id, hint: npc ? npc.title : '有一个人，你还没记住。', note: npc ? npc.bio : '名字已经落下。' };
+        const on = !!(a.person && a.person[id]);
+        const name = (typeof NPCS !== 'undefined' && NPCS[id] && NPCS[id].name) || book.name;
+        let pic = '';
+        if (on && typeof InkPortrait !== 'undefined' && InkPortrait.svg) pic = InkPortrait.svg(id) || '';
+        const art = pic ? `<div class="codex-art portrait">${pic}</div>` : `<div class="codex-art sil-art"><b class="seal-face">${esc((typeof NPCS !== 'undefined' && NPCS[id] && NPCS[id].seal) || name.slice(0, 1))}</b></div>`;
+        return { on, art, title: name, line: book.note };
+      }));
+    }
+    const enc = Samsara.encounterCatalog();
+    return enc.map((e, i) => {
+      const on = !!(a.encounter && a.encounter[e.id]);
+      const art = on ? `<div class="codex-art seal-art"><b>${esc(e.seal || '缘')}</b></div>` : `<div class="codex-art sil-art">${sil('door')}</div>`;
+      return card(on, art, e.title, on ? '这一笔，已经落在你的卷上。' : vague[i % vague.length]);
+    }).join('');
+  }
+  function paint() {
+    const m = Samsara.loadMeta();
+    const st = Samsara.volumeStats ? Samsara.volumeStats(m) : null;
+    const tabs = CODEX_TABS.map(([id, name]) => {
+      return `<button type="button" class="codex-tab${cur === id ? ' on' : ''}" data-tab="${id}">${name}</button>`;
+    }).join('');
+    const reward = st && st[cur] && st[cur].done ? `<p class="codex-reward">${esc(CODEX_REWARD[cur] || '')}</p>` : '<p class="codex-reward dim">集齐此卷，得一桩妆点。不加修为，不加灵石。</p>';
+    const pals = [['', '素纸', true], ['songyan', '松烟', !!(m.boons && m.boons.gongfa)], ['lengjin', '冷金', !!(m.boons && m.boons.fabao)], ['yuqing', '雨青', !!(m.boons && m.boons.encounter)]].filter(x => x[2]);
+    const palRow = pals.length > 1 ? `<div class="codex-pals">${pals.map(([id, name]) => `<button type="button" class="codex-pal${(m.palette || '') === id ? ' on' : ''}" data-pal="${id}">${name}</button>`).join('')}</div>` : '';
+    let epi = '';
+    if (cur === 'ending') {
+      const rows = (m.epitaphs || []).slice(0, 8).map((ep, i) => {
+        const nm = END_BOOK[ep.ending] ? END_BOOK[ep.ending].name : (ep.ending || '');
+        return `<button type="button" class="atlas-epi" data-i="${i}"><b>${esc(ep.name || '无名')} · ${esc(nm)}</b><span>${cn(ep.age)}岁</span></button>`;
+      }).join('');
+      epi = `<section class="atlas-sec"><h4>墓志</h4><div class="atlas-epis">${rows || '<p class="atlas-empty">尚无墓志。</p>'}</div><pre class="atlas-long" id="atlas-long-view" hidden></pre></section>`;
+    }
+    const headN = st && st[cur] ? `${cn(st[cur].got)} / ${cn(st[cur].max)}` : '';
+    w.innerHTML = `<div class="codex-tabs">${tabs}</div><p class="codex-count">本卷 ${headN}　·　轮回 ${cn((m.lives | 0))} 世</p>${reward}${palRow}<div class="codex-grid">${entries(m, cur) || '<p class="atlas-empty">这一卷还是空的。</p>'}</div>${epi}`;
+  }
+  w.addEventListener('click', e => {
+    const tab = e.target.closest('[data-tab]');
+    if (tab) { cur = tab.dataset.tab; paint(); return; }
+    const pal = e.target.closest('[data-pal]');
+    if (pal && Samsara.setPalette) { Samsara.setPalette(pal.dataset.pal); applyPalette(); paint(); return; }
+    const b = e.target.closest('.atlas-epi');
+    if (!b) return;
+    const m = Samsara.loadMeta();
+    const ep = (m.epitaphs || [])[+b.dataset.i];
+    if (!ep) return;
+    const view = w.querySelector('#atlas-long-view');
+    if (!view) return;
+    view.hidden = false;
+    view.textContent = ep.text || ep.short || '';
+    w.querySelectorAll('.atlas-epi').forEach(x => x.classList.toggle('on', x === b));
+  });
+  paint();
+  openSheet('仙途志', w);
+}
+
+/* ================= 终卷 ================= */
+const END_ART = {
+  hongchen: '<svg viewBox="0 0 320 120"><path d="M45 103h230M75 103V64l40-23 40 23v39M165 103V49l42-26 42 26v54M66 65h97M154 49h106M105 103V80h20v23M198 103V70h20v33" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="207" cy="56" r="4" fill="currentColor"/></svg>',
+  ascend: `<svg viewBox="0 0 320 120"><g class="ea-rays">${Array.from({ length: 13 }, (_, i) => { const a = (-90 + (i - 6) * 13) * Math.PI / 180; return `<path d="M160 118 L${(160 + Math.cos(a) * 190).toFixed(1)} ${(118 + Math.sin(a) * 190).toFixed(1)}" />`; }).join('')}</g><circle class="ea-sun" cx="160" cy="118" r="34"/></svg>`,
+  zuohua: `<svg viewBox="0 0 320 120"><path d="M236 16 V108 M236 16 H300 V108" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M308 36 C286 42 264 40 240 54" fill="none" stroke="currentColor" stroke-width=".8" opacity=".45"/><path d="M22 90 H214" stroke="currentColor" stroke-width="1.5"/><path d="M34 90 V110 H202 V90" fill="none" stroke="currentColor" stroke-width="1.15"/><g fill="none" stroke="currentColor"><circle cx="108" cy="25" r="3.2" stroke-width="1.05"/><path d="M108 28 V31" stroke-width="1"/><circle cx="108" cy="35" r="6.4" stroke-width="1.25"/><path d="M108 41.4 V48" stroke-width="1.05"/><path d="M99 50 L117 50" stroke-width="1.15"/><path d="M99 50 L74 90" stroke-width="1.2"/><path d="M117 50 L142 90" stroke-width="1.2"/><path d="M108 50 V84" stroke-width=".6" opacity=".4"/><path d="M74 90 C66 80 54 82 50 90" stroke-width="1.15"/><path d="M142 90 C151 80 162 82 166 90" stroke-width="1.15"/></g><path d="M186 90 V82 H200 V90" fill="none" stroke="currentColor" stroke-width="1.1"/><path d="M184 90 H202" stroke="currentColor" stroke-width="1.15"/><path d="M193 82 V68" stroke="currentColor" stroke-width="1.05"/><circle class="ea-ember" cx="193" cy="66.4" r="1.6" fill="currentColor"/><path class="ea-smoke" d="M193 64 C186 52 200 46 193 34 C186 24 198 16 190 6"/></svg>`,
+  rumo: `<svg viewBox="0 0 320 120"><g class="ea-drips">${[[92, 26, 2.2, 6], [121, 64, 4.5, 2], [151, 18, 1.6, 10], [174, 48, 3.2, 0], [207, 82, 5.5, 4], [236, 34, 2.6, 12]].map(([x, h, w, y0], i) => `<path d="M${x - w} ${y0} C${x - w * .6} ${y0 + h * .55} ${x - w * .9} ${y0 + h} ${x} ${y0 + h + w * 1.6} C${x + w * .9} ${y0 + h} ${x + w * .6} ${y0 + h * .55} ${x + w} ${y0}Z" style="animation-delay:${(.4 + i * .19).toFixed(2)}s"/>`).join('')}</g></svg>`,
+  guiyin: `<svg viewBox="0 0 320 120"><circle class="ea-moon" cx="244" cy="30" r="16"/><g class="ea-boat"><path d="M96 80 Q160 98 226 77 L214 88 Q160 104 108 90Z"/><path class="ea-pole" d="M151 84 L198 26"/></g><g class="ea-boat ea-refl"><path d="M96 98 Q160 84 226 100 L214 93 Q160 80 108 92Z"/></g><g class="ea-waves"><path d="M30 96 Q60 92 90 96 T151 96 T210 96 T290 96"/><path d="M70 108 Q100 104 130 108 T190 108 T250 108"/></g></svg>`,
+  bingjie: `<svg viewBox="0 0 320 120"><g class="ea-sword"><path class="ea-blade1" d="M104 92 L168 52 Q172 51 173 55 L110 97Z"/><path class="ea-blade2" d="M180 46 L236 12 Q240 12 239 16 L186 52Z"/><path class="ea-guard" d="M92 82 Q98 80 116 104 Q112 108 108 104 Q100 92 90 86Z"/><path class="ea-hilt" d="M100 100 L80 116"/></g><g class="ea-motes">${Array.from({ length: 16 }, (_, i) => `<circle cx="${176 + (i * 37) % 64 - 20}" cy="${50 - (i * 23) % 42}" r="${1 + (i % 3) * .8}" style="animation-delay:${(i * .19).toFixed(2)}s"/>`).join('')}</g></svg>`,
+  yunluo: `<svg viewBox="0 0 320 120"><path class="ea-bolt" d="M184 -4 L156 42 L172 44 L142 92 L160 94 L132 124 L166 88 L151 86 L182 38 L166 36 L192 -4Z"/><path class="ea-bolt thin" d="M156 42 L134 58 L140 64 L116 86 L151 60 L140 56 L162 44Z"/></svg>`,
+  renhuang: `<svg viewBox="0 0 320 120"><g class="ea-throne"><rect x="130" y="48" width="60" height="52" rx="3" fill="none" stroke="currentColor" stroke-width="2"/><path d="M120 48 L160 18 L200 48" fill="none" stroke="currentColor" stroke-width="2.2"/><circle cx="160" cy="28" r="6" fill="currentColor" opacity=".55"/><path d="M140 100 H180" stroke="currentColor" stroke-width="2"/></g><g class="ea-rays" opacity=".45">${Array.from({length:9},(_,i)=>{const a=(-90+(i-4)*12)*Math.PI/180;return `<path d="M160 22 L${(160+Math.cos(a)*90).toFixed(1)} ${(22+Math.sin(a)*90).toFixed(1)}"/>`;}).join('')}</g></svg>`,
+  quancheng: `<svg viewBox="0 0 320 120"><g class="ea-seal"><rect x="118" y="28" width="84" height="84" rx="6" fill="none" stroke="currentColor" stroke-width="2.4"/><text x="160" y="86" text-anchor="middle" font-size="42" class="seal-font" fill="currentColor" opacity=".85">摄</text></g></svg>`,
+  huashen: `<svg viewBox="0 0 320 120"><path d="M118 96 L160 42 L202 96" fill="none" stroke="currentColor" stroke-width="2"/><path d="M136 96 V72 H184 V96" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="232" cy="36" r="10" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M70 100 H250" stroke="currentColor" stroke-width="1" opacity=".45"/></svg>`,
+  zhenmo: `<svg viewBox="0 0 320 120"><path d="M151 18 V92" stroke="currentColor" stroke-width="2"/><path d="M132 40 H168" stroke="currentColor" stroke-width="1.6"/><path d="M160 96 C120 108 90 78 70 110" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".8"/><path d="M168 100 C210 112 250 70 280 104" fill="none" stroke="currentColor" stroke-width="1.4" opacity=".7"/></svg>`,
+  chuanshuo: `<svg viewBox="0 0 320 120"><rect x="132" y="22" width="56" height="82" fill="none" stroke="currentColor" stroke-width="2"/><path d="M151 44 H174 M151 58 H168 M151 72 H170" stroke="currentColor" stroke-width="1.3"/><path d="M70 104 H250" stroke="currentColor" stroke-width="1" opacity=".4"/></svg>`,
+};
+END_ART.fanren = END_ART.hongchen;
+function showEnd(kind) {
+  if (!S) return;
+  if (S.flags && S.flags.trial) return showTrialEnd();
+  $('#btn-scroll').hidden = false;
+  $('#btn-reborn .bb-text').textContent = '再入轮回';
+  kind = kind || S.ending || 'zuohua';
+  const e = $('#end'); e.hidden = false;
+  e.className = 'end end-' + kind;
+  let art = e.querySelector('.end-art');
+  if (!art) { art = document.createElement('div'); art.className = 'end-art'; e.querySelector('.end-paper').prepend(art); }
+  art.innerHTML = END_ART[kind] || '';
+  const age = cn(S.age), rs = realmStr(), evs = S.events ? '历奇遇' + cn(S.events) + '桩' : '一生未逢奇遇';
+  const cr = typeof courtRankName === 'function' ? courtRankName(S) : '';
+  const courtLine = cr ? `官至${cr}，兵${cn((S.court&&S.court.bing)||0)}·民${cn((S.court&&S.court.min)||0)}·道${cn((S.court&&S.court.dao)||0)}。` : '';
+  const T = {
+    hongchen: ['红尘仙', `${S.name}历${age}载春秋，修至${rs}。天门已开，你却回望人间的灯。入世修行，终得正果。世人称红尘仙。`],
+    ascend: ['飞升', `${S.name}，以${S.lg.name}之资${(Core.pathSummary(S)||[]).length ? '，行' + (Core.pathSummary(S)||[]).map(x=>x.name).join('·') + '之路' : ''}，历${age}载春秋，终渡九重天劫，白日飞升。青冥山下的樵夫说，那一日，满山松涛都静了一瞬。`],
+    zuohua: ['坐化', `${age}岁那年冬天，你在洞府中静静合上了眼。生前修至${rs}，${evs}。山风穿过石门，吹散了案上未写完的手札。` + pick(['青山不语，白云自去。', '一生求长生，长生终未得。', '此身原是客，何处不归途。'])],
+    fanren: ['凡尘一生', `${S.name}历${age}载春秋，未曾把名字写进仙门谱牒，却把一年年过成了自己的日子。${S.childhood && S.childhood.skills.read >= 6 ? '读过的书后来还在村塾里传看。' : '屋檐下晒过的谷物、修好的旧物，都留着你的手心温度。'}人虽远去，村中仍有人记得你。`],
+    rumo: ['入魔', `${age}岁那年，${S.gf && GONGFA[S.gf].mo ? '《' + GONGFA[S.gf].name + '》在你体内' : '心魔在你识海中'}日夜低语，终于有一夜，你再也分不清哪一个声音是自己。后来有人在血雾谷见过一个赤瞳之人，修为通天，却认不得任何一位故人。` + pick(['一念成魔，万劫难复。', '墨落成血，再难洗白。'])],
+    guiyin: ['归隐', `${S.name}修至${rs}，于${age}岁那年放下了长生。此后青冥山中少了一位修士，桃花溪上多了一叶扁舟。有渔人说，常见一个老者在江心垂钓，钓线上从不挂饵；后来，连那舟也不见了，只剩空船自横。`],
+    bingjie: ['兵解', `${rs}破关之际，天威如山，肉身寸寸崩解。袖中兵解玉符应声而碎，一缕真灵遁出，没入茫茫轮回。此生修为尽散，道心未绝——来世入道之时，或可忆起今日。`],
+    yunluo: ['身殒', `${rs}破关失利，经脉寸断，${age}载苦修化作山间一缕青烟。同门在你的洞府前立了一块无字碑，碑前的野草，年年都长得很高。` + pick(['大道无情，从不等人。', '天道之下，众生皆刍狗。'])],
+    renhuang: ['人皇', `${S.name}修至${rs}，${courtLine}于${age}岁登基，建元人皇。史官写下：仙凡一统，自此人主天下。山门钟声那日齐哑——有人说是敬畏，有人说是诀别。`],
+    quancheng: ['权臣', `${S.name}修至${rs}，${courtLine}于${age}岁摄政，不篡位号。诏令出其手，军权归其心。史书不敢直书其名，只写「摄政如天」。`],
+    huashen: ['山神', `${S.name}修至${rs}，于${age}岁停在那座没有门的祠前。名字刻得很浅。浅，是因为山会自己把字长深。此后过路人放一枚干果，风会替你点头。`],
+    zhenmo: ['镇魔', `${S.name}修至${rs}，于${age}岁坐上裂口。剑横在膝上，不是为了杀，是做一个很沉的镇纸。潮声在身下慢慢变成普通的风。`],
+    chuanshuo: ['传说', `${S.name}修至${rs}，于${age}岁把这一生删到很薄，放进石室，封面上没有名字。后世用别人的嘴讲你。讲着讲着，就成了真的。`],
+  }[kind] || ['坐化', ''];
+  const Lp = S.loop || {};
+  let endTail = '';
+  if (kind === 'ascend' && Lp.jianAsk === 'fei') endTail += '剑意随你而去。';
+  if (kind === 'ascend' && Lp.qiAsk === 'fei') endTail += '器与你同飞。';
+  if (kind === 'ascend' && Lp.qiAsk === 'shou') endTail += '器留在洞府守山。';
+  if (kind === 'guiyin' && Lp.luAsk === 'gui') endTail += '炉冷了。';
+  if (kind === 'zuohua' && (Lp.ti | 0) >= 6) endTail += '这一身比旁人厚些。';
+  if (kind === 'bingjie' && S.path && S.path.daoji === 'ti') endTail += '肉身先碎，体魄还留在那一问里。';
+  if ((kind === 'huashen' || kind === 'zhenmo') && Lp.zhenAsk === 'sit') endTail += '阵在，人在。';
+  if (endTail) T[1] += endTail;
+  $('#end-title').textContent = T[0];
+  const composed = (typeof Life !== 'undefined' && Life.compose) ? Life.compose(S, kind, T[1]) : null;
+  const recLine = composed ? [T[1], composed.juebi, composed.variant, composed.judge].filter(Boolean).join('') : T[1];
+  const isTrial = !!(S.flags && S.flags.trial);
+  let rec = null, recordFailed = false, dismissFailed = false;
+  try {
+  if (typeof Samsara !== 'undefined' && Samsara.recordLife) {
+    if (isTrial) {
+      const m = Samsara.loadMeta();
+      Samsara.unlockAtlas(m, S, kind);
+      Samsara.saveMeta(m);
+      rec = { epitaph: Samsara.epitaphLong(S, kind, recLine), legacy: null };
+    } else {
+      rec = Samsara.recordLife(S, kind, recLine);
+    }
+  }
+  } catch (err) { recordFailed = true; toast('开卷未成，请稍后重试'); }
+  const epitaph = composed
+    ? composed.juebi + (endTail && composed.juebi.indexOf(endTail) < 0 ? endTail : '')
+    : T[1];
+  $('#end-epitaph').textContent = epitaph;
+  const judgeEl = $('#end-judge');
+  const judgeBits = [];
+  if (judgeEl) {
+    const pushOnce = (bit) => {
+      if (!bit) return;
+      if (epitaph.indexOf(bit) >= 0) return;
+      if (judgeBits.some(b => b.indexOf(bit) >= 0)) return;
+      judgeBits.push(bit);
+    };
+    if (composed) {
+      pushOnce(composed.judge);
+      pushOnce(composed.variant);
+      pushOnce(composed.thread);
+    }
+    judgeEl.textContent = judgeBits.join('');
+    judgeEl.hidden = !judgeBits.length;
+  }
+  const longEl = $('#end-epitaph-long');
+  if (longEl) {
+    const lgName = (S.lg && S.lg.id === 'wei' ? '' : (S.lgEls || []).join('')) + ((S.lg && S.lg.name) || '');
+    const lines = [];
+    lines.push(`名讳 ${S.name || '无名'}　灵根 ${lgName}`);
+    lines.push(`境界 ${rs}　春秋 ${age} 载`);
+    const pth = (Core.pathSummary(S) || []).map(x => x.name).join('·');
+    if (pth) lines.push(`定型 ${pth}`);
+    if (S.gf && GONGFA[S.gf]) lines.push(`主修 《${GONGFA[S.gf].name}》`);
+    if (S.fabao) lines.push(`本命 ${S.fabao.name}·${FABAO_STAGE[S.fabao.stage | 0]}`);
+    const org = S.sect && S.sect.org && typeof ORGS !== 'undefined' && ORGS[S.sect.org] ? ORGS[S.sect.org].name : '';
+    const rank = org && ORGS[S.sect.org].ranks ? (ORGS[S.sect.org].ranks[S.sect.rank | 0] || '') : '';
+    if (org) lines.push(`门墙 ${org}${rank ? ' · ' + rank : ''}`);
+    if (S.court && (S.court.rank | 0) >= 0 && typeof courtRankName === 'function') {
+      const court = courtRankName(S);
+      if (court) lines.push(`皇命 ${court}`);
+    }
+    if (S.events) lines.push(`奇遇 ${cn(S.events)} 桩`);
+    lines.push(`悟性 ${cn(S.wx)}　心境 ${xinjingWord(S.xj)}`);
+    const archived = (typeof Samsara !== 'undefined' && Samsara.epitaphLong) ? Samsara.epitaphLong(S, kind, '') : '';
+    const last = String(archived || '').trim().split('\n').filter(Boolean).pop() || '';
+    const seal = kind === 'ascend' ? '' : (last || '青石一方，记此一念。');
+    const shown = epitaph + judgeBits.join('');
+    const body = lines.filter(t => t && shown.indexOf(t) < 0);
+    const bio = body.concat(seal ? ['', seal] : []).join('\n');
+    longEl.textContent = bio;
+    longEl.hidden = !bio.trim();
+  }
+  if (!isTrial && rec && rec.bridge && rec.bridge.words && longEl) {
+    longEl.textContent += '\n\n留印「' + rec.bridge.words.seal + '」。' + rec.bridge.words.verse;
+    longEl.hidden = false;
+  }
+  const legObj = rec && rec.legacy;
+  const carry = [];
+  if (legObj) {
+    if (legObj.wx) carry.push(`悟性 +${legObj.wx}`);
+    if (legObj.canhun) carry.push('法宝残魂');
+    if (legObj.daoji) carry.push('道基残忆');
+    if (legObj.auxPage) carry.push('功法残页');
+    if (legObj.sectMark) carry.push('门派印记');
+    if (legObj.courtMark) carry.push('皇命印记');
+    if (legObj.cave) carry.push('旧洞残钥');
+  }
+  const leg = kind === 'ascend'
+    ? '<span class="end-legacy">此世已毕，可开下一世</span>'
+    : (carry.length ? `<span class="end-legacy">来世可承 · ${carry.join(' · ')}</span>`
+      : (isTrial ? '<span class="end-legacy">试炼局 · 不入轮回簿</span>' : '<span class="end-legacy">奈何桥上，只许带一样</span>'));
+  if (!recordFailed && kind === 'ascend' && typeof Samsara !== 'undefined' && Samsara.dismissBridge) {
+    try { Samsara.dismissBridge(); } catch (err) { dismissFailed = true; toast('开卷未成，请稍后重试'); }
+  }
+  $('#end-stats').innerHTML = leg;
+  save();
+  $('#btn-reborn').onclick = async () => {
+    if (recordFailed) { showEnd(kind); return; }
+    if (!S) return;
+    if (dismissFailed) {
+      try { Samsara.dismissBridge(); dismissFailed = false; }
+      catch (err) { toast('开卷未成，请稍后重试'); return; }
+    }
+    const proceed = () => {
+      const kept = typeof Slots !== 'undefined' && Slots.firstEmpty() >= 0;
+      e.hidden = true; S = null;
+      window.__trialStart = false;
+      if (kept) toast('前卷留在存档里');
+      else if (typeof Slots !== 'undefined') window.__slotTarget = Slots.newestIndex();
+      clearOpeningSex(); resetCreate(); initTitle();
+      unrollTo('title').then(() => { const btn = $('#btn-new'); if (btn) btn.click(); });
+    };
+    try {
+      if (!isTrial) {
+        const meta = typeof Samsara !== 'undefined' ? Samsara.loadMeta(true) : JSON.parse(Slots.readEffect('moxian.meta') || '{}');
+        if (meta.bridge && meta.bridge.open) {
+          openNaihe(proceed, () => { e.hidden = false; });
+          return;
+        }
+      }
+      proceed();
+    } catch (err) { toast('开卷未成，请稍后重试'); }
+  };
+  const btnAtlasEnd = $('#btn-end-atlas');
+  if (btnAtlasEnd) btnAtlasEnd.onclick = () => openAtlasSheet();
+  const btnScroll = $('#btn-scroll');
+  if (btnScroll) btnScroll.onclick = () => saveScroll(kind, T[0]);
+}
+
+function showTrialEnd() {
+  const trial = Core.trialStatus(S);
+  if (!trial) return;
+  const result = trial.result || 'ended';
+  if (!S.flags.trialResult) S.flags.trialEndReason = S.ending || '';
+  S.flags.trialResult = result; S.dead = true; S.ending = 'trial';
+  const success = result === 'success', end = $('#end');
+  end.hidden = false; end.className = 'end end-trial';
+  const art = end.querySelector('.end-art'); if (art) art.innerHTML = '';
+  $('#end-title').textContent = success ? '试炼达成' : '试炼收卷';
+  $('#end-epitaph').textContent = success ? '二十载内，你已踏入金丹中期。这一障已破，此次试炼达成。'
+    : result === 'timeout' ? '二十载之期已至。行动完整结算，目标未在期限内达成。'
+      : (({ rumo: '心境失守，提前入魔。', guiyin: '主动归隐，提前收卷。', yunluo: '此身身殒，提前离场。', bingjie: '此身兵解，提前离场。', zuohua: '寿元已尽，提前收卷。' })[S.flags.trialEndReason] || '此身提前离场。') + '本次目标未达成。';
+  $('#end-judge').hidden = false;
+  $('#end-judge').textContent = '目标：二十载内达到金丹中期。实际：' + realmStr() + '，用时' + cnDur(Math.round(Math.max(0, S.months - 480))) + '。';
+  $('#end-epitaph-long').hidden = true;
+  $('#end-epitaph-long').textContent = '';
+  $('#end-stats').textContent = '试炼不入轮回簿，不产生前世遗泽。所见定型与神器仍记入仙途志。';
+  $('#btn-scroll').hidden = true;
+  $('#btn-reborn .bb-text').textContent = '再试一卷';
+  $('#btn-reborn').onclick = async () => {
+    if (!(await pickSlotForNew(true))) return;
+    end.hidden = true; S = null; busy = false;
+    window.__trialStart = true;
+    clearOpeningSex(); resetCreate(); initTitle(); unrollTo('create');
+  };
+  $('#btn-end-atlas').onclick = () => openAtlasSheet();
+  if (typeof Samsara !== 'undefined') {
+    const meta = Samsara.loadMeta();
+    Samsara.unlockAtlas(meta, S, null);
+    Samsara.saveMeta(meta);
+  }
+  save();
+}
+const END_SEAL = { ascend: '升', hongchen: '尘', zuohua: '化', rumo: '魔', guiyin: '隐', bingjie: '解', yunluo: '殒', renhuang: '皇', quancheng: '摄' };
+async function saveScroll(kind, title) {
+  if (!S || typeof ScrollArt === 'undefined') { toast('绘卷未备'); return; }
+  const view = $('#scroll-view');
+  const img = $('#scroll-img');
+  if (!view || !img) return;
+  toast('正在落墨…');
+  let canvas;
+  try { canvas = await ScrollArt.render(S, kind, title); }
+  catch (err) { console.warn(err); toast('绘卷未成'); return; }
+  const blob = await new Promise(r => canvas.toBlob(r, 'image/png'));
+  if (!blob) { toast('绘卷未成'); return; }
+  const url = URL.createObjectURL(blob);
+  if (img._url) URL.revokeObjectURL(img._url);
+  img._url = url;
+  img.src = url;
+  img.alt = (S.name || '无名') + ' · ' + (title || '终卷');
+  view.hidden = false;
+  requestAnimationFrame(() => view.classList.add('open'));
+  const file = new File([blob], '纸上仙途.png', { type: 'image/png' });
+  const shareBtn = $('#scroll-share');
+  const can = navigator.share && (!navigator.canShare || navigator.canShare({ files: [file] }));
+  if (shareBtn) {
+    shareBtn.querySelector('.bb-text').textContent = can ? '分享' : '打开图片';
+    shareBtn.onclick = async () => {
+      if (can) {
+        try { await navigator.share({ files: [file], title: '纸上仙途', text: [S.name || '', title || '', '纸上仙途'].filter(Boolean).join(' · ') }); return; }
+        catch (e) { if (e && e.name === 'AbortError') return; }
+      }
+      const w = window.open(url, '_blank');
+      if (!w) toast('长按图片，即可保存');
+    };
+  }
+}
+function closeScrollView() {
+  const view = $('#scroll-view');
+  if (!view) return;
+  view.classList.remove('open');
+  setTimeout(() => { view.hidden = true; }, 320);
+}
+
+/* ================= 江湖界面 ================= */
+const JHUI = typeof makeJHUI === 'function' ? makeJHUI({ get S() { return S; }, get busy() { return busy; }, set busy(v) { busy = v; },
+  $, sleep, pick, render, save, pushLog, openEvent, openSheet, closeSheet, toast, inkWrite, buffer, checkEnd, runDuel, realmStr, fmtNum, K, chanceWord, mountFoeSlip, choiceSub }) : undefined;
+
+/* ================= 此生所求 / 平生 / 纸墨 ================= */
+const LOOK_KEY = 'moxian.look';
+function readLook() {
+  try { return JSON.parse(localStorage.getItem(LOOK_KEY) || '{}') || {}; } catch (e) { return {}; }
+}
+function applyPalette() {
+  let p = '';
+  if (typeof Samsara !== 'undefined' && Samsara.loadMeta) {
+    const m = Samsara.loadMeta();
+    const map = { songyan: 'gongfa', lengjin: 'fabao', yuqing: 'encounter' };
+    if (m.palette && map[m.palette] && m.boons && m.boons[map[m.palette]]) p = m.palette;
+  }
+  if (p) document.documentElement.dataset.palette = p;
+  else delete document.documentElement.dataset.palette;
+}
+function applyLook(partial) {
+  const prev = readLook();
+  const prevTheme = document.documentElement.dataset.theme || '';
+  const p = Object.assign({ theme: 'auto', font: 'md', motion: 'full', seasonPlate: 'on' }, prev, partial || {});
+  try { localStorage.setItem(LOOK_KEY, JSON.stringify({ theme: p.theme, font: p.font, motion: p.motion, seasonPlate: p.seasonPlate === 'off' ? 'off' : 'on' })); } catch (e) {}
+  const dark = p.theme === 'night' || (p.theme !== 'day' && matchMedia('(prefers-color-scheme: dark)').matches);
+  const nextTheme = dark ? 'night' : 'day';
+  document.documentElement.dataset.theme = nextTheme;
+  document.documentElement.dataset.font = (p.font === 'lg' || p.font === 'sm') ? p.font : 'md';
+  document.documentElement.dataset.motion = p.motion === 'lite' ? 'lite' : 'full';
+  document.documentElement.dataset.seasonPlate = p.seasonPlate === 'off' ? 'off' : 'on';
+  applyPalette();
+  const wantThin = p.motion === 'lite' || matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (wantThin) {
+    document.documentElement.dataset.fx = 'thin';
+    delete document.documentElement.dataset.fxAuto;
+  } else if (partial && partial.motion === 'full') {
+    delete document.documentElement.dataset.fx;
+    delete document.documentElement.dataset.fxAuto;
+  }
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.setAttribute('content', dark ? '#16130f' : '#efe6d3');
+  const apple = document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]');
+  if (apple) apple.setAttribute('content', dark ? 'black' : 'default');
+  root.style.setProperty('--brush-night-ink', brushBtnImg(44, '#4a4036', 0.92));
+  root.style.setProperty('--brush-img-zhu', brushBtnImg(27, dark ? '#9c4038' : '#b3302a', dark ? 0.94 : 0.92));
+  if (typeof FX !== 'undefined' && FX.syncMotion) FX.syncMotion();
+  if (typeof Wallpaper !== 'undefined' && Wallpaper.syncMotion) Wallpaper.syncMotion();
+  // 开卷前山与壁纸已经画过。主题没变就不要在墨滴落地的同一帧整页重绘。
+  if (prevTheme !== nextTheme) drawMountains(true, { yield: prevTheme !== '' });
+}
+function openLook() {
+  const p = Object.assign({ theme: 'auto', font: 'md', motion: 'full', seasonPlate: 'on' }, readLook());
+  const w = document.createElement('div');
+  w.className = 'look-sheet';
+  const row = (k, label, opts) => `<div class="look-row" data-k="${k}"><b>${label}</b><div class="look-opts">${opts.map(([id, name]) => `<button type="button" class="look-opt${p[k] === id ? ' on' : ''}" data-v="${id}">${name}</button>`).join('')}</div></div>`;
+  w.innerHTML = `<p class="look-lead">纸还是那张纸。昼夜、字号与动效都记在这卷之外，不入存档。</p>
+    ${row('theme', '昼夜', [['auto', '自动'], ['day', '昼'], ['night', '夜']])}
+    ${row('font', '字号', [['sm', '小'], ['md', '中'], ['lg', '大']])}
+    ${row('motion', '动效', [['full', '全'], ['lite', '简']])}
+    ${row('seasonPlate', '四季册景', [['on', '开'], ['off', '关']])}
+    <p class="look-note">夜墨是深纸与淡墨，卷面仍暖。简则收雾、落花与翻卷。若画面吃力，动效会自己变薄，回稳后再复原。四季册景关上，主卷回默认纸景，历法季名仍在。</p>`;
+  w.addEventListener('click', e => {
+    const b = e.target.closest('.look-opt'); if (!b) return;
+    const rowEl = b.closest('.look-row');
+    const k = rowEl.dataset.k, v = b.dataset.v;
+    rowEl.querySelectorAll('.look-opt').forEach(x => x.classList.toggle('on', x === b));
+    applyLook({ [k]: v });
+  });
+  openSheet('纸墨', w);
+}
+function openSexSheet() {
+  if (!S || typeof Folio === 'undefined') return;
+  const w = document.createElement('div');
+  w.className = 'look-sheet';
+  const curS = (S.who && S.who.sex) || 'm';
+  const curM = (S.who && S.who.mate) || 'any';
+  const row = (k, label, cur, opts) => `<div class="look-row" data-k="${k}"><b>${label}</b><div class="look-opts">${opts.map(([id, name]) => `<button type="button" class="look-opt${cur === id ? ' on' : ''}" data-v="${id}">${name}</button>`).join('')}</div></div>`;
+  w.innerHTML = `<p class="look-lead">此身如何被称呼，道侣心意偏向哪一边。旧卷若从未写过，沿用原来的「师兄」便是。改过之后，纸上的称呼跟着改。</p>
+    ${row('sex', '此身', curS, [['m', '男'], ['f', '女'], ['n', '不言']])}
+    ${row('mate', '道侣', curM, [['f', '女'], ['m', '男'], ['any', '随缘']])}
+    <button type="button" class="menu-item" data-a="ok">落定</button>`;
+  const picked = { sex: curS, mate: curM };
+  w.addEventListener('click', e => {
+    const b = e.target.closest('.look-opt'); if (!b) return;
+    const rowEl = b.closest('.look-row');
+    picked[rowEl.dataset.k] = b.dataset.v;
+    rowEl.querySelectorAll('.look-opt').forEach(x => x.classList.toggle('on', x === b));
+  });
+  w.querySelector('[data-a=ok]').onclick = async () => {
+    Folio.setWho(S, picked.sex, picked.mate);
+    await closeSheet();
+    save(); render();
+    toast(picked.sex === 'f' ? '此后称师姐' : picked.sex === 'n' ? '此后称同门' : '此后仍称师兄');
+  };
+  openSheet('此身', w);
+}
+function stockName(k) {
+  const id = Core.manualId && Core.manualId(k);
+  if (id && GONGFA[id]) return '《' + GONGFA[id].name + '》';
+  return k;
+}
+function openShop() {
+  if (!S || typeof Redworld === 'undefined') return;
+  const w = document.createElement('div'); w.className = 'shop-sheet';
+  const button = (a, k, label, sub, disabled) => `<button type="button" class="menu-item${sub === '先回应来人' ? ' is-wait' : ''}" data-a="${a}" data-k="${esc(k || '')}"${disabled ? ' disabled' : ''}>${esc(label)}<small>${esc(sub || '')}</small></button>`;
+  let keepShelf = false;
+  const paint = () => {
+    const opened = [];
+    w.querySelectorAll('details').forEach(d => opened.push(d.open));
+    const forceShelf = keepShelf;
+    keepShelf = false;
+    const h = Redworld.ensure(S), at = S.loc === 'yunyue', dur = cnDur(Redworld.months(S));
+    const q = Redworld.quote(S, 'normal'), cash = fmtNum(S.ls), inventory = Object.keys(S.items).filter(k => S.items[k] > 0 && Redworld.sellable(k));
+    const pendingText = { victim: '苦主拿着掺假的药上门。', inspect: '执法堂来查铺，旧客站在门外。', foe: '仇家翻出你少秤的那一笔。', petition: '祠前来人求情，要你替他撑过这一季。', attack: '邪修来砸祠，香火正被风吹得摇晃。' }[h.pending];
+    const pending = pendingText ? `<section class="shop-col"><b>有人来</b><p>${pendingText}</p>${button('respond','pay',h.pending === 'attack' ? '花钱守祠' : '认下这桩事',dur + ' · 灵石 −' + Redworld.troubleCost(S),S.ls < Redworld.troubleCost(S))}${button('respond','leave',h.pending === 'attack' ? '弃祠' : '这次不应','不耗光阴与灵石' + (h.pending === 'attack' ? ' · 道果冻结' : ' · 旧账未平'))}</section>` : '';
+    const quoteHtml = mode => {
+      const x = Redworld.quote(S, mode);
+      const labels = { normal: '照常开季', honest: '赊给穷修士 · 不卖假货', fraud: '掺假少秤', guard: '阵基 · 接守铺', haul: '体基 · 扛一次货' };
+      return button('season',mode,labels[mode],`${dur} · 进账 ${x.low}–${x.high} · 租金 ${x.rent}` + (mode === 'honest' ? ' · 余款赊免，不追收' : ''),!at || !x.gross || !!h.pending || S.ls < x.rent);
+    };
+    const shelves = Object.keys(h.stock).filter(k => h.stock[k] > 0);
+    const stores = h.stores.map((t,i) => `<p>${i ? '分店' + i : '主店'} · ${Redworld.SPOTS[t.spot][0]} · ${t.own ? '旧契买断，免租' : t.paidUntil > S.months ? '租约余' + cnDur(t.paidUntil-S.months) : '租约已到，下次开季先续'}${!t.own ? ' · 续季 ' + Redworld.rent(S,t.spot) + ' 灵石' : ''}</p>`).join('');
+    const lead = h.stores.length ? '已有铺面，此刻休市。点开季才是本季营业；不点则不卖货、不扣租。' : '尚未开铺。';
+    w.innerHTML = `<p class="look-lead">${lead}开铺、经营须在云岳坊。耗时${dur}，与游历相同。</p>
+      <p class="shop-note">灵石 ${cash} · 口碑 ${h.rep} · 正邪 ${h.moral}<br>红尘道果 ${h.fruit} · ${h.shrine === -1 ? '祠毁，暂不增长' : '诚实开季、行善与凡人因果积累'}<br>化神末门：道果至少 24，正邪至少 20，方能选择留在人间。</p>
+      ${pending}
+      <section class="shop-col"><b>铺面 · ${h.stores.length}/3</b>${stores}${h.recovery ? `<p>人情债 ${h.debt} · 东山再起：连续诚实 ${h.honest}/3 季，或还清欠账。</p>${button('repay','','还清人情债','灵石 −'+h.debt, !h.debt || S.ls<h.debt)}` : ''}
+      <details><summary>${h.stores.length ? '添一间／迁主店' : '租一间铺面'}</summary><p>分店风险：掌柜可能卷货；口碑一跌，各店一起亏；钱十三在世时会来抢客。连主店总共最多三间。迁店不退旧租金，旧买断免租权随迁店放弃。</p>${Object.keys(Redworld.SPOTS).map(spot => {
+        const why=Redworld.reason(S,spot), cost=h.recovery&&h.rescue===1&&!h.stores.length?0:Redworld.rent(S,spot);
+        return button('lease',spot,'租'+Redworld.SPOTS[spot][0],why || `首季灵石 −${cost} · 租期${dur}`,!!why || h.stores.length>=3 || (h.stores.length>0&&h.rep<20) || S.ls<cost)
+          +(h.stores.length ? button('move',spot,'主店迁到'+Redworld.SPOTS[spot][0],why || '首季灵石 −'+Redworld.rent(S,spot),!!why || S.ls<Redworld.rent(S,spot)) : '');
+      }).join('')}</details></section>
+      ${h.stores.length ? `<section class="shop-col"><b>这一季</b><p>总入账上限：本境聚气丹街价 ${Redworld.cap(S)} × 店数 ${h.stores.length} = ${q.ceiling}。道基不增加上限；租金另扣。</p>
+      <div class="shop-prices">${Object.keys(Redworld.PRICES).map(k=>button('price',k,(h.price===k?'已选 · ':'')+Redworld.PRICES[k][0],{low:'市价八成 · 客多利薄',fair:'市价',high:'市价一倍两成五 · 口碑低会滞销'}[k],!at)).join('')}</div>
+      <p>${q.sales.length ? '拟售：'+q.sales.map(x=>esc(Redworld.name(x.key))+'×'+x.n+'，单价'+x.unit).join('；') : '本季没有可售的整件货。'}${q.blocked.length ? '<br>本季未列入（名额、价格上限或不可售）：'+q.blocked.map(esc).join('、')+'。原物留架，可取回。' : ''}</p>
+      <p>${esc(q.risk.join('；') || '本季照常售货没有额外经营风险。')}<br>良心季度赊免部分货款；掺假当季收满，口碑 −18，正邪 ${S.path.daoji==='mo'?'−8':'−4'}，随后有苦主查铺。</p>
+      ${quoteHtml('normal')}${quoteHtml('honest')}${quoteHtml('fraud')}${S.path.daoji==='zhen'?quoteHtml('guard'):''}${S.path.daoji==='ti'&&!h.haul?quoteHtml('haul'):''}
+      ${S.ls<q.rent?button('bankrupt','','交回铺面','货返行囊 · 人情债 '+q.rent+' · 口碑减半',!at):''}
+      ${button('skip','','这季不去铺子','收卷后可照常修行 · 不耗光阴与灵石')}
+      </section>` : ''}
+      <details class="shop-col"><summary>货架与进货 · ${shelves.length} 类</summary><p>自备货不记现金成本；进货按坊市实价扣款。器基可卖现成普通法器，本命法宝与神器不入架。</p>
+      ${shelves.map(k=>button('take',k,Redworld.name(k)+' ×'+h.stock[k],'取回 · 入架参考价 '+Redworld.reference(S,k),!at)).join('') || '<p>空架</p>'}
+      ${h.stores.length ? inventory.map(k=>button('put',k,'上架一件（持有'+S.items[k]+'）',k+' · 自备 · 市价参考 '+Redworld.reference(S,k),!at)).join('') : ''}
+      ${h.stores.length ? Object.keys(S.mkt.st).filter(k=>S.mkt.st[k]>0 && ITEM_VAL[k]).map(k=>button('purchase',k,'进货 '+k+' 一件','灵石 −'+Jianghu.price(S,k),!at || S.ls<Jianghu.price(S,k))).join('') : ''}
+      ${h.stores.length && S.path.daoji==='dan' ? S.dan.rec.map(id=>button('craft',id,'自炼入架 · '+RECIPES[id].out,cnDur(Core.timeMonths(S,Jianghu.danMonths(S,id)))+' · 耗丹方药材 · 可能炸炉',!at || !Jianghu.hasHerbs(S,id))).join('') : ''}</details>
+      <section class="shop-col"><b>人间灯火</b><p>施药 ${h.goods.medicine} · 留夜 ${h.goods.shelter} · 疫镇 ${h.goods.plague}<br>${['未立祠','乡人立祠','金身已塑'][h.shrine] || '祠毁待修'}。三次善事立祠，六次塑像，不加属性。</p>
+      ${button('help','medicine','施药',h.pending?'先回应来人':dur+' · 回春丹 −1',!(S.items['回春丹']>0)||!!h.pending)}
+      ${button('help','shelter','留夜',h.pending?'先回应来人':dur+' · 灵石 −'+Math.max(1,Math.floor(Redworld.cap(S)*.2)),S.ls<Math.max(1,Math.floor(Redworld.cap(S)*.2))||!!h.pending)}
+      ${button('help','plague','不绕开疫镇',h.pending?'先回应来人':dur+' · 清心丹 −1',!(S.items['清心丹']>0)||!!h.pending)}
+      <p>行善须在青石镇、云岳坊或京城。香火每十二个实际年仅一次：心境或免轻伤二选一。${h.incenseAt>S.months?'距下次 '+cnDur(h.incenseAt-S.months):''}${h.shield?' · 免轻伤庇佑尚在':''}</p>
+      ${h.shrine>0?button('blessing','heart','领香火 · 心境 +2',h.pending?'先回应来人':'不耗光阴',S.months<h.incenseAt||!!h.pending)+button('blessing','shield','领香火 · 免一次轻伤',h.pending?'先回应来人':'不免重伤，不叠层',!!h.shield||S.months<h.incenseAt||!!h.pending):''}
+      ${h.shrine===-1?button('rebuild','','重修祠堂',dur+' · 灵石 −'+Redworld.troubleCost(S),S.ls<Redworld.troubleCost(S)):''}</section>
+      <details class="shop-col shop-ledger"><summary>铺子账本 · 最近四十笔</summary><p>累计现金收入 ${h.income} · 支出 ${h.expense} · 净额 ${h.income-h.expense}<br>自备货只记参考价，不视作现金支出；未收的赊免款不计收入。</p>${h.ledger.slice().reverse().map(x=>`<p><b>${Math.floor(x.at/12)}岁 · ${esc(x.text)}</b><br>收 ${x.income} ／支 ${x.expense} ／净 ${x.income-x.expense}<br>${esc(x.detail)}</p>`).join('') || '<p>这一页尚空。</p>'}</details>`;
+    w.querySelectorAll('details').forEach((d, i) => {
+      if (opened[i] || (forceShelf && d.classList.contains('shop-col') && !d.classList.contains('shop-ledger'))) d.open = true;
+    });
+    w.querySelectorAll('[data-a]').forEach(b => { b.onclick = async () => {
+      if (busy) return;
+      const a=b.dataset.a,k=b.dataset.k,B=buffer(); let r;
+      if(a==='skip'){await closeSheet();return;}
+      if(a==='price'){h.price=k;save();paint();return;}
+      if(a==='put'||a==='take'||a==='purchase'||a==='craft') keepShelf = true;
+      if(a==='lease'||a==='move')r=Redworld.lease(S,k,a==='move');
+      else if(a==='put')r=Redworld.put(S,k);
+      else if(a==='take')r=Redworld.take(S,k);
+      else if(a==='purchase')r=Redworld.purchase(S,k);
+      else if(a==='craft')r=Redworld.craft(S,k,B.emit);
+      else if(a==='season')r=Redworld.season(S,k,B.emit);
+      else if(a==='bankrupt')r=Redworld.bankrupt(S);
+      else if(a==='repay')r=Redworld.repay(S);
+      else if(a==='help')r=Redworld.help(S,k,B.emit);
+      else if(a==='blessing')r=Redworld.blessing(S,k);
+      else if(a==='respond')r=Redworld.respond(S,k,B.emit);
+      else if(a==='rebuild')r=Redworld.rebuild(S,B.emit);
+      if(!r){keepShelf=false;return;}if(r.err){keepShelf=false;toast(r.err);return;}
+      if(r.text)pushLog({title:'红尘',text:r.text,tags:r.tags,cls:'sys'});
+      B.flush();render();save();
+      if(S.dead){await closeSheet();checkEnd();return;}paint();
+    }; });
+  };
+  paint();openSheet('铺子 · 红尘',w);
+}
+
+function openGoalPicker() {
+  if (!S || typeof Life === 'undefined') return Promise.resolve(null);
+  const pc = $('#goal-cer'); if (!pc) return Promise.resolve(null);
+  return new Promise(resolve => {
+    pc.hidden = false; pc.className = 'path-cer goal-cer go';
+    const seal = $('#goal-seal'); if (seal) seal.textContent = '求';
+    const lead = $('#goal-lead');
+    if (lead) lead.textContent = '';
+    const opts = $('#goal-opts'); opts.innerHTML = '';
+    const foot = $('#goal-foot'); foot.hidden = false;
+    const conf = $('#goal-confirm'); conf.disabled = true;
+    const hint = $('#goal-hint'); if (hint) hint.textContent = '择一愿。闭关时，或可再改';
+    let selected = S.life && S.life.goal;
+    inkWrite(lead, '入山之前，先问自己一句。此生所求，不必告诉别人。卷终时，纸会记得你有没有做到。', { immediate: true, step: snappy() ? 8 : 18 });
+    Life.GOALS.forEach((g, i) => {
+      const b = document.createElement('button');
+      b.type = 'button'; b.className = 'path-opt' + (selected === g.id ? ' on' : '');
+      b.style.animationDelay = (0.05 * i) + 's';
+      b.innerHTML = `<span class="po-seal"></span><span class="po-body"><b></b><em></em><p></p></span>`;
+      b.querySelector('.po-seal').textContent = g.seal;
+      b.querySelector('b').textContent = g.name;
+      b.querySelector('em').textContent = '此生所求';
+      b.querySelector('p').textContent = g.hint;
+      b.onclick = () => {
+        selected = g.id;
+        opts.querySelectorAll('.path-opt').forEach(x => x.classList.toggle('on', x === b));
+        conf.disabled = false;
+        if (hint) hint.textContent = '落定 · ' + g.name;
+      };
+      opts.appendChild(b);
+    });
+    if (selected) conf.disabled = false;
+    conf.onclick = async () => {
+      if (!selected) return;
+      const g = Life.setGoal(S, selected, !!(S.life && S.life.goal && S.life.goal !== selected));
+      pc.classList.add('leave');
+      await sleep(snappy() ? 180 : 420);
+      pc.hidden = true; pc.className = 'path-cer goal-cer';
+      if (g) pushLog({ title: '此生所求', text: `你在心里写下一行很小的字：${g.name}。${g.hint}`, cls: 'gold' });
+      render(); save();
+      resolve(g);
+      maybeGuide();
+    };
+  });
+}
+function openAnnals() {
+  if (!S || typeof Life === 'undefined') { toast('平生未启'); return; }
+  const c = Life.chronicle(S);
+  const w = document.createElement('div');
+  w.className = 'annals';
+  const goal = c.goal ? `${c.goal.name}` : '尚未落笔';
+  const scars = c.scars.length ? c.scars.map(x => x.text).slice(0, 3).map(t => `<p>${esc(t)}</p>`).join('') : '<p class="annals-empty">识海尚无暗伤。</p>';
+  const people = c.people.length ? c.people.map(p => `<li><b>${esc(p.name)}</b><em>${cn(p.y)}岁</em><span>${esc(p.note || '')}</span></li>`).join('') : '<li class="annals-empty">还没有记下谁。</li>';
+  const years = c.years.length ? c.years.map(y => `<section class="annals-year"><h4>${cn(y.y)}岁</h4>${y.items.map(it => `<article class="${esc(it.k || '')}"><b>${esc(it.t || '·')}</b><p>${esc(it.d || '')}</p></article>`).join('')}</section>`).join('') : '<p class="annals-empty">这一卷还薄。去活一活，字会自己来。</p>';
+  const deeds = (c.deeds || []).filter(d => !d.done && S.months >= d.due).length;
+  w.innerHTML = `<header class="annals-head">
+      <div class="annals-seal">${esc(c.heart.slice(0, 1))}</div>
+      <div><b>${esc(S.name)}</b><em>心性 · ${esc(c.heart)}</em><em>所求 · ${esc(goal)}</em>${deeds ? `<em class="zhu">回响将至</em>` : ''}</div>
+    </header>
+    <section class="annals-block"><h4>暗伤</h4>${scars}</section>
+    <section class="annals-block"><h4>所遇</h4><ul class="annals-people">${people}</ul></section>
+    <div class="annals-scroll">${years}</div>`;
+  openSheet('平生', w);
+}
+
+/* ================= 启动 ================= */
+$$('.act').forEach(b => b.addEventListener('click', () => {
+  b.classList.remove('pulse'); void b.offsetWidth; b.classList.add('pulse'); setTimeout(() => b.classList.remove('pulse'), 500);
+  if (typeof MoAudio !== 'undefined') MoAudio.uiTap();
+  act(b.dataset.act);
+}));
+$('#btn-break').onclick = openBreak;
+$('#btn-menu').onclick = openMenu;
+$('#btn-sect').onclick = () => { if (!busy && S && !S.dead && !S.ascended) { if (S.mortal) openMortalLife(); else openSect(); } };
+$('#btn-cult').onclick = () => { if (!busy && S && !S.dead && !S.ascended) openCult(); };
+$('#play-menu').onclick = () => { if (!busy && S) openMenu(); };
+$('#play-return').onclick = returnToTitle;
+$('#play-settings').onclick = () => { if (!busy) openLook(); };
+function openCalendar() {
+  if (!S || typeof Calendar === 'undefined') return;
+  openSheet('大黎皇历', Calendar.sheet(S));
+}
+$('#btn-calendar').onclick = openCalendar;
+$('#hud-toggle').onclick = () => {
+  const b = $('#hud-toggle'), open = b.getAttribute('aria-expanded') !== 'true';
+  b.setAttribute('aria-expanded', String(open));
+  b.setAttribute('aria-label', open ? '收起人物详情' : '展开人物详情');
+  $('#scr-main .hud').classList.toggle('details-open', open);
+};
+function setPlayPage(page) {
+  if (!['log', 'cult', 'sect', 'trace'].includes(page)) return;
+  $('#scr-main').dataset.page = page;
+  $$('.play-tabs button').forEach(b => {
+    const selected = b.dataset.page === page;
+    b.setAttribute('aria-selected', String(selected)); b.tabIndex = selected ? 0 : -1;
+  });
+  renderSide();
+}
+$('.play-tabs').onclick = e => {
+  const b = e.target.closest('[data-page]');
+  if (b && !busy && S) setPlayPage(b.dataset.page);
+};
+$('.play-tabs').onkeydown = e => {
+  if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key) || busy) return;
+  const tabs = $$('.play-tabs button'), i = tabs.indexOf(document.activeElement);
+  if (i < 0) return;
+  e.preventDefault();
+  const next = e.key === 'Home' ? 0 : e.key === 'End' ? tabs.length - 1 : (i + (e.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+  setPlayPage(tabs[next].dataset.page); tabs[next].focus();
+};
+$('#play-traces').onclick = () => { if (!busy && S) openTraceSheet(); };
+$('#path-seals').onclick = e => {
+  const s = e.target.closest('.path-seal'); if (!s || busy || !S || S.dead || S.ascended) return;
+  openCult('path');
+};
+FX.initPress(); FX.initParallax();
+if (typeof MoAudio !== 'undefined') {
+  MoAudio.mountUI();
+  const dock = document.getElementById('audio-dock');
+  if (dock && !document.getElementById('btn-look')) {
+    const b = document.createElement('button');
+    b.type = 'button'; b.id = 'btn-look'; b.className = 'audio-btn';
+    b.setAttribute('aria-label', '纸墨');
+    b.innerHTML = '<span class="audio-lab">设</span>';
+    b.addEventListener('click', e => { e.stopPropagation(); openLook(); });
+    dock.insertBefore(b, dock.firstChild);
+  }
+  document.addEventListener('click', e => {
+    const t = e.target.closest('button, .map-tag, .choice, .item-use, .ab, .mc-btn, .stab, .mini-seal, .menu-seal');
+    if (t && !t.closest('#audio-dock')) MoAudio.uiTap();
+  }, true);
+}
+$('#side').onclick = e => {
+  if (e.target.closest('.sd-trace li')) {
+    if (!busy && S && !S.dead && !S.ascended) openTraceSheet();
+    return;
+  }
+  const c = e.target.closest('.side-card'); if (!c || busy || !S || S.dead || S.ascended) return;
+  const k = c.dataset.open; if (k === 'gf') openCult('gf'); else if (k === 'fabao') openCult('fabao'); else if (k === 'path') openCult('path'); else if (k === 'bag') openBag(); else if (k === 'sect') openSect(); else if (k === 'cult') openCult(); else act('youli');
+};
+addEventListener('resize', () => {
+  if (document.body.dataset.screen !== 'main') return;
+  if (innerWidth >= 1000 && $('#scr-main').dataset.page !== 'log') setPlayPage('log');
+  else renderSide();
+});
+
+/* 奇遇：收卷可关；必选未落定时只颤一下，不替玩家跳过。宽屏点遮罩同此。 */
+function choiceBoxShake(box) {
+  if (!box) return;
+  box.classList.remove('ink-shake');
+  void box.offsetWidth;
+  box.classList.add('ink-shake');
+}
+function rollVisible(el) {
+  if (!el || !el.isConnected) return false;
+  const s = getComputedStyle(el);
+  if (s.display === 'none' || s.visibility === 'hidden' || parseFloat(s.opacity) < 0.45) return false;
+  const r = el.getBoundingClientRect();
+  return r.width > 8 && r.height > 8;
+}
+function dismissEventLayer() {
+  const close = [...modal.querySelectorAll('#ev-result .brush-btn')].find(b => { const t = b.textContent || ''; return t.indexOf('收卷') >= 0 || t.indexOf('入场') >= 0; });
+  if (rollVisible(close)) { close.click(); return; }
+  const box = $('#ev-choices');
+  const pending = box && !box.classList.contains('chosen') && box.querySelector('.choice');
+  const manual = modal.querySelector('.manual-choices');
+  const manualPending = manual && !manual.classList.contains('chosen') && manual.querySelector('.choice');
+  if (pending || manualPending || (box && box.classList.contains('chosen'))) {
+    choiceBoxShake(pending ? box : manual || box);
+    return;
+  }
+  closeModal();
+}
+const modalShade = modal.querySelector('.modal-shade');
+if (modalShade) modalShade.addEventListener('click', () => {
+  if (!window.matchMedia || !matchMedia('(min-width:700px)').matches) return;
+  if (modal.hidden || !modal.classList.contains('open')) return;
+  dismissEventLayer();
+});
+
+/* ================= 键盘：1-4 行动 · Esc 收起 · Enter 确认 · 方向键（地图/斗法） ================= */
+const vis = el => !!el && !el.hidden && el.offsetParent !== null && !el.disabled;
+const firstVis = (root, sel) => [...root.querySelectorAll(sel)].find(vis);
+function topLayer() {
+  const ask = document.querySelector('.ask'); if (ask) return ask;
+  for (const id of ['scroll-view', 'end', 'rite', 'dan', 'auc', 'duel', 'bt', 'path-cer', 'origin-cer', 'baishan', 'goal-cer', 'modal', 'sheet', 'mj', 'map']) { const el = $('#' + id); if (el && !el.hidden) return el; }
+  return null;
+}
+addEventListener('keydown', e => {
+  if (e.ctrlKey || e.metaKey || e.altKey || e.isComposing) return;
+  const tgt = e.target; if (tgt && (tgt.tagName === 'INPUT' || tgt.tagName === 'TEXTAREA')) { if (e.key === 'Enter' && tgt.id === 'inp-name') tgt.blur(); return; }
+  const L = topLayer(), k = e.key;
+  const click = el => { if (vis(el)) { e.preventDefault(); el.click(); return true; } return false; };
+  if (k === 'Escape') {
+    if (!L) return;
+    if (L.classList.contains('ask')) return click(L.querySelector('.ask-no'));
+    if (L.id === 'scroll-view') { e.preventDefault(); return closeScrollView(); }
+    if (L.id === 'sheet') { e.preventDefault(); return closeSheet(); }
+    if (L.id === 'map') return click($('#map-close'));
+    if (L.id === 'dan') return click($('#dan-close'));
+    if (L.id === 'auc') { e.preventDefault(); if (typeof JHUI !== 'undefined' && JHUI.aucEsc) JHUI.aucEsc(); return; }
+    if (L.id === 'modal') { e.preventDefault(); dismissEventLayer(); return; }
+    if (L.id === 'path-cer' || L.id === 'baishan' || L.id === 'origin-cer') {
+      e.preventDefault();
+      const btn = L.id === 'origin-cer' ? $('#origin-confirm') : L.id === 'baishan' ? $('#baishan-confirm') : $('#path-cer-confirm');
+      const foot = L.id === 'origin-cer' ? $('#origin-foot') : L.id === 'baishan' ? $('#baishan-foot') : $('#path-cer-foot');
+      if (foot && !foot.hidden && btn && !btn.disabled) { btn.focus(); toast('请点「落定」确认，或按 Enter'); }
+      else toast('请先点选一项，再点底部「落定」');
+      return;
+    }
+    return;
+  }
+  const digit = /^[1-9]$/.test(k) ? +k : 0;
+  if (!L) {
+    if (document.body.dataset.screen !== 'main') { if (k === 'Enter' && !(tgt && tgt.tagName === 'BUTTON')) click(firstVis(document.querySelector('.screen:not([hidden])') || document.body, '.brush-btn')); return; }
+    if (digit >= 1 && digit <= 4) return click($$('.act')[digit - 1]);
+    if (k === 'Enter' && !(tgt && tgt.tagName === 'BUTTON')) return click($('#btn-break'));
+    return;
+  }
+  // 斗法：方向键在招式间移动，数字直接出招
+  if (L.id === 'duel') {
+    const ms = [...L.querySelectorAll('.dmove')].filter(b => !b.disabled);
+    if (digit && ms[digit - 1]) return click(ms[digit - 1]);
+    if (k === 'ArrowLeft' || k === 'ArrowRight') { e.preventDefault(); const i = ms.indexOf(document.activeElement); const n = ms[(i < 0 ? 0 : i + (k === 'ArrowRight' ? 1 : -1) + ms.length) % ms.length]; n && n.focus(); return; }
+  }
+  // 地图：方向键换地点，Enter 行动
+  if (L.id === 'map' && typeof JHUI !== 'undefined') {
+    if (k === 'ArrowLeft' || k === 'ArrowRight') { e.preventDefault(); return JHUI.mapKey(k === 'ArrowRight' ? 1 : -1); }
+    if (k === 'Enter' && !(tgt && tgt.tagName === 'BUTTON' && L.contains(tgt))) return click(firstVis(L, '.mc-btn.on') || firstVis(L, '.mc-btn'));
+  }
+  // 奇遇：数字选择
+  if (L.id === 'modal' && digit) { const cs = [...L.querySelectorAll('.choice')].filter(vis); if (cs[digit - 1]) return click(cs[digit - 1]); }
+  if (k === 'Enter') {
+    if (tgt && tgt.tagName === 'BUTTON' && L.contains(tgt) && vis(tgt) && tgt.id !== 'path-cer-confirm' && tgt.id !== 'baishan-confirm') return;
+    if (L.classList.contains('ask')) return click(L.querySelector('.ask-ok'));
+    if (L.id === 'sheet') return;
+    if (L.id === 'path-cer') {
+      const b = $('#path-cer-confirm'), f = $('#path-cer-foot');
+      if (f && !f.hidden && b && !b.disabled) return click(b);
+      toast('请先点选定型'); return;
+    }
+    if (L.id === 'baishan') {
+      const b = $('#baishan-confirm'), f = $('#baishan-foot');
+      if (f && !f.hidden && b && !b.disabled) return click(b);
+      toast('请先点选门户'); return;
+    }
+    if (L.id === 'origin-cer') {
+      const b = $('#origin-confirm'), f = $('#origin-foot');
+      if (f && !f.hidden && b && !b.disabled) return click(b);
+      toast('请先点选出身'); return;
+    }
+    return click(firstVis(L, '.brush-btn:not(.ask-no)'));
+  }
+});
+setScreen('title');
+initTitle(); initCreate();
+applyLook();
+try {
+  const mq = matchMedia('(prefers-color-scheme: dark)');
+  if (mq && mq.addEventListener) mq.addEventListener('change', () => { if ((readLook().theme || 'auto') === 'auto') applyLook(); });
+} catch (e) {}
+if (matchMedia('(display-mode: standalone)').matches || navigator.standalone) document.documentElement.dataset.standalone = '1';
+const scrollClose = $('#scroll-close');
+if (scrollClose) scrollClose.onclick = () => closeScrollView();
+const scrollShade = document.querySelector('#scroll-view .scroll-shade');
+if (scrollShade) scrollShade.onclick = () => closeScrollView();
+
+function preloadSplash() {
+  const urls = ['img/open-plate.png?v=169', 'img/open-glyph.png?v=169', 'img/open-seal-logo.png?v=169'];
+  const jobs = urls.map(u => new Promise(res => {
+    const im = new Image();
+    im.onload = im.onerror = () => res();
+    im.src = u;
+  }));
+  return Promise.race([Promise.all(jobs), sleep(1400)]);
+}
+function splashSoft() {
+  const root = document.documentElement;
+  /* 省电档 data-fx=thin 不缩短这段。动效简与系统减少动效才走同一叙事的短版。 */
+  return matchMedia('(prefers-reduced-motion: reduce)').matches
+    || root.getAttribute('data-motion') === 'lite';
+}
+function splashWait() {
+  const el = document.getElementById('splash');
+  if (!el) return Promise.resolve();
+  const soft = splashSoft();
+  const skip = document.getElementById('intro-skip');
+  const menu = document.getElementById('scr-title');
+  const rm = matchMedia('(prefers-reduced-motion: reduce)');
+  const controls = [...menu.querySelectorAll('button'), ...document.querySelectorAll('#audio-dock button, #audio-dock input')];
+  const disabled = controls.map(b => b.disabled);
+  controls.forEach(b => { b.disabled = true; });
+  menu.setAttribute('aria-busy', 'true');
+  const body = document.body;
+  const root = document.documentElement;
+  const boatEl = document.getElementById('voyage-boat');
+  const boatSvg = boatEl ? boatEl.querySelector('svg') : null;
+  const rings = document.getElementById('voyage-rings');
+  const ringA = document.getElementById('ring-a');
+  const ringB = document.getElementById('ring-b');
+  const ringC = document.getElementById('ring-c');
+  el.hidden = false;
+  el.setAttribute('aria-hidden', 'false');
+  body.classList.add('go', 'hold', 'sheet', 'voyage');
+  body.classList.remove('ink-await');
+  if (skip) skip.hidden = false;
+  root.dataset.openingMode = soft ? 'quiet' : 'full';
+  const T = soft
+    ? { paint: 1500, drop: 680, wave: 1050, beat: 160, inscribe: 1320 }
+    : { paint: 4800, drop: 2300, wave: 4200, beat: 480, inscribe: 3400 };
+  return new Promise(resolve => {
+    let phase = 'paint';
+    let timer = 0;
+    let raf = 0;
+    let motion = null;
+    let geo = null;
+    let menuStarted = 0, releaseTimer = 0;
+    const mark = (name, p) => { root.dataset.voyagePhase = name; if (p != null) root.dataset.voyageP = String(Math.round(p)); };
+    mark('paint', 0);
+    const swallowClick = ev => { ev.preventDefault(); ev.stopImmediatePropagation(); };
+    const bleedCanvas = document.getElementById('voyage-bleed');
+    let bleedCtx = null;
+    let bleedOrder = null;
+    let bleedAlpha = null;
+    let bleedMax = 1;
+    let bleedImg = null;
+    let bleedW = 0;
+    let bleedH = 0;
+    let bleedInk = '';
+    let bleedRGB = [27, 24, 20];
+    let bleedAt = -1;
+    const SAMP = 3;
+    const prepareBleed = () => {
+      if (!bleedCanvas || bleedOrder) return;
+      bleedW = 120 * SAMP;
+      bleedH = 70 * SAMP;
+      bleedCanvas.width = bleedW;
+      bleedCanvas.height = bleedH;
+      const off = document.createElement('canvas');
+      off.width = bleedW;
+      off.height = bleedH;
+      const c = off.getContext('2d', { willReadFrequently: true });
+      if (!c) return;
+      c.setTransform(SAMP, 0, 0, SAMP, 0, 0);
+      c.fillStyle = '#000';
+      c.strokeStyle = '#000';
+      c.lineCap = 'round';
+      c.lineJoin = 'round';
+      c.beginPath();
+      c.moveTo(6, 38);
+      c.quadraticCurveTo(60, 50, 114, 34);
+      c.quadraticCurveTo(100, 46, 60, 47);
+      c.quadraticCurveTo(22, 47, 6, 38);
+      c.closePath();
+      c.fill();
+      c.beginPath();
+      c.moveTo(40, 39);
+      c.quadraticCurveTo(52, 22, 74, 24);
+      c.quadraticCurveTo(80, 30, 82, 38);
+      c.quadraticCurveTo(60, 41, 40, 39);
+      c.closePath();
+      c.fill();
+      c.lineWidth = 2.4;
+      c.beginPath();
+      c.moveTo(88, 37);
+      c.lineTo(90, 25);
+      c.stroke();
+      c.beginPath();
+      c.moveTo(82, 25);
+      c.quadraticCurveTo(90, 18, 98, 25);
+      c.closePath();
+      c.fill();
+      c.lineWidth = 1.15;
+      c.beginPath();
+      c.moveTo(95, 33);
+      c.lineTo(58, 6);
+      c.stroke();
+      const src = c.getImageData(0, 0, bleedW, bleedH).data;
+      const n = bleedW * bleedH;
+      bleedOrder = new Float32Array(n);
+      bleedAlpha = new Uint8Array(n);
+      const sx = 60 * SAMP;
+      const sy = 42 * SAMP;
+      let maxD = 1;
+      for (let i = 0; i < n; i++) {
+        const a = src[i * 4 + 3];
+        bleedAlpha[i] = a;
+        if (a < 16) {
+          bleedOrder[i] = 1e9;
+          continue;
+        }
+        const x = i % bleedW;
+        const y = (i / bleedW) | 0;
+        const noise = Math.sin(x * 0.31) + Math.cos(y * 0.27) + Math.sin((x + y) * 0.17);
+        const dist = Math.hypot(x - sx, y - sy) + noise * 6.5 * SAMP;
+        bleedOrder[i] = dist;
+        if (dist > maxD) maxD = dist;
+      }
+      bleedMax = maxD;
+      bleedCtx = bleedCanvas.getContext('2d', { willReadFrequently: true });
+      if (bleedCtx) bleedImg = bleedCtx.createImageData(bleedW, bleedH);
+    };
+    const readInk = () => {
+      let raw = '';
+      try { raw = getComputedStyle(document.documentElement).getPropertyValue('--ink'); } catch (e) { raw = ''; }
+      raw = (raw || '').trim();
+      if (raw === bleedInk) return;
+      bleedInk = raw;
+      bleedAt = -1;
+      let r = 27;
+      let g = 24;
+      let b = 20;
+      if (raw.charAt(0) === '#' && raw.length >= 7) {
+        r = parseInt(raw.slice(1, 3), 16);
+        g = parseInt(raw.slice(3, 5), 16);
+        b = parseInt(raw.slice(5, 7), 16);
+      } else if (raw.indexOf('rgb') === 0) {
+        const parts = raw.replace(/rgba?\(/, '').replace(')', '').split(',');
+        r = parseInt(parts[0], 10);
+        g = parseInt(parts[1], 10);
+        b = parseInt(parts[2], 10);
+      }
+      if (r !== r) r = 27;
+      if (g !== g) g = 24;
+      if (b !== b) b = 20;
+      bleedRGB = [r, g, b];
+    };
+    const paintBleed = (shape) => {
+      if (!bleedCtx || !bleedImg || !bleedOrder) return;
+      readInk();
+      const s = shape < 0 ? 0 : (shape > 1 ? 1 : shape);
+      if (s >= 1 && bleedAt >= 1) return;
+      bleedAt = s;
+      const reach = 11 * SAMP + s * (bleedMax - 11 * SAMP);
+      const data = bleedImg.data;
+      const r = bleedRGB[0];
+      const g = bleedRGB[1];
+      const b = bleedRGB[2];
+      const n = bleedW * bleedH;
+      for (let i = 0; i < n; i++) {
+        const o = i * 4;
+        if (bleedOrder[i] <= reach) {
+          data[o] = r;
+          data[o + 1] = g;
+          data[o + 2] = b;
+          data[o + 3] = bleedAlpha[i];
+        } else {
+          data[o + 3] = 0;
+        }
+      }
+      bleedCtx.putImageData(bleedImg, 0, 0);
+    };
+    prepareBleed();
+    const paintBoat = (x, y, shape, stretch) => {
+      if (!boatEl) return;
+      const s = shape < 0 ? 0 : (shape > 1 ? 1 : shape);
+      boatEl.hidden = false;
+      if (boatSvg) boatSvg.style.display = 'none';
+      boatEl.style.left = x + 'px';
+      boatEl.style.top = y + 'px';
+      if (s <= 0.001) {
+        const w = 8;
+        const h = 10;
+        boatEl.style.width = w + 'px';
+        boatEl.style.height = h + 'px';
+        boatEl.style.marginLeft = (-w / 2) + 'px';
+        boatEl.style.marginTop = (-h / 2) + 'px';
+        boatEl.style.backgroundColor = 'var(--ink)';
+        boatEl.style.borderRadius = '50%';
+        boatEl.style.overflow = 'hidden';
+        boatEl.style.transformOrigin = '50% 50%';
+        boatEl.style.transform = stretch === 1 ? 'none' : ('scaleY(' + stretch + ')');
+        if (bleedCanvas) bleedCanvas.style.display = 'none';
+        return;
+      }
+      const w = 50;
+      const h = 29;
+      const anchorY = 17.4 + (14.5 - 17.4) * s;
+      boatEl.style.width = w + 'px';
+      boatEl.style.height = h + 'px';
+      boatEl.style.marginLeft = '-25px';
+      boatEl.style.marginTop = (-anchorY) + 'px';
+      boatEl.style.backgroundColor = 'transparent';
+      boatEl.style.borderRadius = '0';
+      boatEl.style.overflow = 'visible';
+      boatEl.style.transform = 'none';
+      if (bleedCanvas) bleedCanvas.style.display = 'block';
+      paintBleed(s);
+    };
+    const setHole = (cx, cy, r) => {
+      const rr = r < 1 ? 1 : r;
+      // 掌上揭幕留宽羽边，水纹经过题字与朱印时逐渐淡开。
+      const portrait = innerWidth < 700 && innerHeight > innerWidth;
+      const feather = portrait ? Math.min(240, Math.max(48, rr * .32)) : Math.min(140, Math.max(18, rr * .16));
+      const edge = rr - feather;
+      const mask = 'radial-gradient(circle ' + rr.toFixed(2) + 'px at ' + cx.toFixed(2) + 'px ' + cy.toFixed(2) + 'px, rgba(255,255,255,0) ' + (edge < 0 ? 0 : edge).toFixed(2) + 'px, #fff ' + rr.toFixed(2) + 'px)';
+      el.style.webkitMaskImage = mask;
+      el.style.maskImage = mask;
+      el.style.webkitMaskRepeat = 'no-repeat';
+      el.style.maskRepeat = 'no-repeat';
+      el.style.webkitMaskPosition = '0 0';
+      el.style.maskPosition = '0 0';
+      el.style.webkitMaskSize = '100% 100%';
+      el.style.maskSize = '100% 100%';
+    };
+    const clearHole = () => {
+      el.style.webkitMaskImage = '';
+      el.style.maskImage = '';
+    };
+    const setRings = (cx, cy, r) => {
+      if (!rings) return;
+      const place = (node, rad, width) => {
+        if (!node) return;
+        if (rad < 8) {
+          node.style.display = 'none';
+          return;
+        }
+        const d = rad * 2;
+        node.style.display = 'block';
+        node.style.width = d + 'px';
+        node.style.height = d + 'px';
+        node.style.left = cx + 'px';
+        node.style.top = cy + 'px';
+        node.style.marginLeft = (-rad) + 'px';
+        node.style.marginTop = (-rad) + 'px';
+        node.style.borderWidth = width + 'px';
+      };
+      // 水纹只留在落墨处；山河显露的边缘由柔和遮罩承担。
+      const fade = Math.max(0, 1 - (r - 40) / 280);
+      rings.style.opacity = String(fade * .22);
+      place(ringA, Math.min(130, r), 1);
+      place(ringB, Math.min(100, r * .74), .7);
+      place(ringC, Math.min(72, r * .5), .5);
+    };
+    const measure = () => {
+      const real = document.querySelector('#scenery .boat');
+      let restX = window.innerWidth * 0.58;
+      let restY = window.innerHeight * 0.8;
+      if (real) {
+        const b = real.getBoundingClientRect();
+        if (b.width > 2) {
+          restX = b.left + b.width / 2;
+          restY = b.top + b.height / 2;
+        }
+      }
+      const board = el.querySelector('.splash-board');
+      let ox = window.innerWidth * 0.62;
+      let oy = window.innerHeight * 0.22;
+      if (board) {
+        const rct = board.getBoundingClientRect();
+        if (rct.width > 2) {
+          ox = rct.left + rct.width * .66;
+          oy = rct.top + rct.height * .72;
+        }
+      }
+      const shift = Math.min(48, window.innerWidth * 0.05);
+      const landX = restX - shift;
+      const landY = restY + 4;
+      const rMax = Math.hypot(
+        Math.max(landX, window.innerWidth - landX),
+        Math.max(landY, window.innerHeight - landY)
+      ) + 28;
+      return { ox: ox, oy: oy, restX: restX, restY: restY, landX: landX, landY: landY, rMax: rMax };
+    };
+    const frameDrop = t => {
+      const u = !motion || motion.dur <= 0 ? 1 : Math.min(1, (t - motion.t0) / motion.dur);
+      const g = geo;
+      const fallEnd = 0.48;
+      if (boatEl) boatEl.style.opacity = String(Math.min(1, u * 14));
+      let x;
+      let y;
+      let shape = 0;
+      let stretch = 1;
+      if (u < fallEnd) {
+        const f = u / fallEnd;
+        const e = f * f * (2 - f);
+        x = g.ox + (g.landX - g.ox) * (f * f * (3 - 2 * f));
+        y = g.oy + (g.landY - g.oy) * e;
+        stretch = 1 + 0.42 * Math.sin(f * Math.PI);
+        mark(f < 0.45 ? 'fall' : 'boat', Math.round(f * 40));
+      } else {
+        const f = (u - fallEnd) / (1 - fallEnd);
+        const e = 1 - Math.pow(1 - f, 3);
+        x = g.landX;
+        y = g.landY;
+        shape = e;
+        mark('boat', Math.round(40 + shape * 60));
+      }
+      paintBoat(x, y, shape, stretch);
+      if (u >= 1) beginWave();
+      else raf = requestAnimationFrame(frameDrop);
+    };
+    const beginDrop = () => {
+      if (phase === 'fall' || phase === 'wave' || phase === 'settle' || phase === 'menu' || phase === 'done') return;
+      phase = 'fall';
+      geo = measure();
+      mark('fall', 0);
+      paintBoat(geo.ox, geo.oy, 0, 1);
+      motion = { t0: performance.now(), dur: T.drop };
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(frameDrop);
+    };
+    const frameWave = t => {
+      const u = !motion || motion.dur <= 0 ? 1 : Math.min(1, (t - motion.t0) / motion.dur);
+      const g = geo;
+      const glideU = Math.min(1, u / 0.82);
+      const ge = 1 - Math.pow(1 - glideU, 3);
+      paintBoat(g.landX + (g.restX - g.landX) * ge, g.landY + (g.restY - g.landY) * ge, 1, 1);
+      const r0 = 40;
+      const spread = u * u * (3 - 2 * u);
+      const r = r0 + (g.rMax - r0) * spread;
+      if (u >= .68) revealMenu();
+      setHole(g.landX, g.landY, r);
+      setRings(g.landX, g.landY, r);
+      mark('wave', Math.round(u * 100));
+      if (u >= 1) beginSettle();
+      else raf = requestAnimationFrame(frameWave);
+    };
+    const beginWave = () => {
+      if (phase === 'wave' || phase === 'settle' || phase === 'menu' || phase === 'done') return;
+      phase = 'wave';
+      el.classList.add('wave');
+      geo = geo || measure();
+      if (rings) rings.hidden = false;
+      setHole(geo.landX, geo.landY, 40);
+      setRings(geo.landX, geo.landY, 40);
+      paintBoat(geo.landX, geo.landY, 1, 1);
+      motion = { t0: performance.now(), dur: T.wave };
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(frameWave);
+    };
+    const revealMenu = () => {
+      if (menuStarted) return;
+      menuStarted = performance.now();
+      body.classList.remove('hold'); body.classList.add('inscribe-go');
+    };
+    const beginSettle = () => {
+      if (phase === 'settle' || phase === 'menu' || phase === 'done') return;
+      phase = 'settle'; mark('settle', 100);
+      revealMenu(); body.classList.add('boat-live');
+      if (boatEl) boatEl.style.opacity = '0';
+      if (rings) rings.hidden = true;
+      el.hidden = true; el.setAttribute('aria-hidden', 'true'); clearHole();
+      clearTimeout(timer); timer = setTimeout(beginInscribe, T.beat);
+    };
+    const beginInscribe = () => {
+      if (phase === 'menu' || phase === 'done') return;
+      phase = 'menu'; mark('menu', 100);
+      if (boatEl) boatEl.hidden = true;
+      timer = setTimeout(() => finish(false), Math.max(100, T.inscribe - (performance.now() - menuStarted)));
+    };
+    const finish = (skipped, gesture) => {
+      if (phase === 'done') return;
+      phase = 'done'; mark('done', 100);
+      clearTimeout(timer); cancelAnimationFrame(raf);
+      body.classList.remove('hold'); body.classList.add('inscribe-go', 'boat-live', 'voyage-live');
+      if (skipped || soft) body.classList.add('voyage-skipped');
+      el.hidden = true; el.setAttribute('aria-hidden', 'true'); clearHole();
+      if (boatEl) boatEl.hidden = true;
+      if (rings) rings.hidden = true;
+      menu.setAttribute('aria-busy', 'false'); controls.forEach((b, i) => { b.disabled = disabled[i]; });
+      const focused = skip && document.activeElement === skip;
+      if (skip) skip.hidden = true;
+      if (focused) ($('#btn-continue').hidden ? $('#btn-new') : $('#btn-continue')).focus({ preventScroll: true });
+      window.removeEventListener('pointerdown', onSkip, true);
+      window.removeEventListener('resize', onResize);
+      document.removeEventListener('visibilitychange', onVisibility);
+      if (rm.removeEventListener) rm.removeEventListener('change', onMotion); else rm.removeListener(onMotion);
+      if (skipped && gesture) {
+        window.addEventListener(gesture.type === 'keydown' ? 'keyup' : 'pointerup', onRelease, true);
+        window.addEventListener('pointercancel', onRelease, true); window.addEventListener('blur', onRelease, true);
+        releaseTimer = setTimeout(onRelease, 10000);
+      } else if (skipped) onRelease();
+      else { window.removeEventListener('keydown', onSkip, true); window.removeEventListener('click', onClick, true); }
+      if (typeof Wallpaper !== 'undefined') Wallpaper.kick(0);
+      resolve();
+    };
+    const onRelease = e => {
+      if (e && e.type !== 'blur') swallowClick(e);
+      clearTimeout(releaseTimer);
+      ['keyup', 'pointerup', 'pointercancel', 'blur'].forEach(type => window.removeEventListener(type, onRelease, true));
+      window.removeEventListener('keydown', onSkip, true);
+      setTimeout(() => window.removeEventListener('click', onClick, true), 350);
+    };
+    const onSkip = e => {
+      if (e.type === 'keydown' && !['Escape', 'Enter', ' '].includes(e.key)) return;
+      if (e.type === 'pointerdown' && e.button != null && e.button !== 0) return;
+      swallowClick(e); finish(true, e);
+    };
+    const onClick = e => { swallowClick(e); if (e.target === skip) finish(true); };
+    const onVisibility = () => { if (document.hidden) finish(true); };
+    const onMotion = () => { if (rm.matches) finish(true); };
+    const onResize = () => {
+      if (phase === 'done') return;
+      geo = measure();
+      if (brushCtx && sourcePlate && sourceGlyph) {
+        const progress = paintDone ? 1 : Math.min(1, (performance.now() - motion.t0) / motion.dur);
+        sizeBrush(); brushCursor = 0;
+        while (brushCursor < brushPts.length && brushPts[brushCursor].t <= progress) stampBrush(brushPts[brushCursor++]);
+        if (paintDone) finishPaint(true);
+      }
+    };
+    window.addEventListener('pointerdown', onSkip, true); window.addEventListener('keydown', onSkip, true);
+    window.addEventListener('click', onClick, true); window.addEventListener('resize', onResize);
+    document.addEventListener('visibilitychange', onVisibility);
+    if (rm.addEventListener) rm.addEventListener('change', onMotion); else rm.addListener(onMotion);
+    const brush = document.getElementById('splash-brush');
+    let brushCtx = null;
+    let brushW = 0;
+    let brushH = 0;
+    let brushDpr = 1;
+    let plateImg = null;
+    let glyphImg = null, sourcePlate = null, sourceGlyph = null;
+    let brushPts = null;
+    let brushCursor = 0;
+    let paintDone = false;
+    const loadInk = (url) => new Promise(res => {
+      const im = new Image();
+      im.onload = () => res(im);
+      im.onerror = () => res(null);
+      im.src = url;
+    });
+    const finishPaint = force => {
+      if (paintDone && !force) return;
+      paintDone = true;
+      const seal = el.querySelector('.logo-seal');
+      if (seal) seal.classList.add('stamping');
+      if (!brushCtx || !plateImg || !plateImg.width) {
+        el.classList.add('painted');
+        return;
+      }
+      brushCtx.setTransform(brushDpr, 0, 0, brushDpr, 0, 0);
+      brushCtx.clearRect(0, 0, brushW, brushH);
+      brushCtx.drawImage(plateImg, 0, 0, brushW, brushH);
+      if (glyphImg && glyphImg.width) brushCtx.drawImage(glyphImg, 0, 0, brushW, brushH);
+    };
+    const stampBrush = (p) => {
+      if (!brushCtx) return;
+      brushCtx.save();
+      brushCtx.beginPath();
+      if (p.axis === 'box') brushCtx.rect(p.x0, p.y0, p.x1 - p.x0, p.y1 - p.y0);
+      else if (p.r < 0.35) { brushCtx.restore(); return; }
+      else if (p.axis === 'h') brushCtx.ellipse(p.x, p.y, Math.max(0.5, p.r * 0.42), p.r, 0, 0, Math.PI * 2);
+      else if (p.axis === 'r') brushCtx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+      else brushCtx.ellipse(p.x, p.y, p.r, Math.max(0.5, p.r * 0.42), 0, 0, Math.PI * 2);
+      brushCtx.clip();
+      brushCtx.globalAlpha = p.ink;
+      if (plateImg && plateImg.width) brushCtx.drawImage(plateImg, 0, 0, brushW, brushH);
+      if (glyphImg && glyphImg.width) brushCtx.drawImage(glyphImg, 0, 0, brushW, brushH);
+      brushCtx.restore();
+    };
+    const buildBrush = () => {
+      const W = brushW;
+      const H = brushH;
+      const segs = [];
+      const pushLine = (x0, y0, x1, y1, r, n, axis, weight) => {
+        const pts = [];
+        for (let i = 0; i <= n; i++) {
+          const t = i / n;
+          const press = Math.sin(Math.pow(t, 0.9) * Math.PI);
+          const sway = Math.sin(t * Math.PI) * r * 0.12;
+          const x = x0 + (x1 - x0) * t + (axis === 'v' ? sway : 0);
+          const y = y0 + (y1 - y0) * t + (axis === 'h' ? sway * 0.4 : 0);
+          pts.push({ x: x, y: y, r: r * (0.46 + 0.54 * press), ink: 0.82 + 0.18 * press, axis: axis });
+        }
+        segs.push({ pts: pts, weight: weight });
+      };
+      const arcN = 28;
+      const arcPts = [];
+      for (let i = 0; i <= arcN; i++) {
+        const t = i / arcN;
+        const ang = Math.PI * (1 - t);
+        const press = Math.sin(t * Math.PI);
+        arcPts.push({
+          x: W * 0.5 + Math.cos(ang) * W * 0.125,
+          y: H * 0.25 - Math.sin(ang) * H * 0.11,
+          r: W * 0.011 * (0.4 + 0.8 * press),
+          ink: 0.78 + 0.22 * press,
+          axis: 'r'
+        });
+      }
+      segs.push({ pts: arcPts, weight: 1.15 });
+      pushLine(W * 0.36, H * 0.2, W * 0.64, H * 0.19, H * 0.055, 16, 'h', 0.55);
+      pushLine(W * 0.34, H * 0.25, W * 0.66, H * 0.27, H * 0.06, 16, 'h', 0.6);
+      pushLine(W * 0.1, H * 0.52, W * 0.3, H * 0.5, H * 0.07, 14, 'h', 0.55);
+      pushLine(W * 0.12, H * 0.66, W * 0.3, H * 0.62, H * 0.055, 12, 'h', 0.4);
+      const chars = [
+        [0.286, 0.396],
+        [0.392, 0.507],
+        [0.50, 0.602],
+        [0.60, 0.72]
+      ];
+      for (let k = 0; k < chars.length; k++) {
+        const x0 = chars[k][0];
+        const x1 = chars[k][1];
+        for (let s = 1; s <= 4; s++) {
+          const x = x0 + (x1 - x0) * (s / 5);
+          pushLine(W * x, H * 0.30, W * x, H * 0.78, W * 0.022, 22, 'v', 0.78);
+        }
+        segs.push({ pts: [{ x: 0, y: 0, r: 1, ink: 1, axis: 'box', x0: W * (x0 - 0.01), y0: H * 0.28, x1: W * (x1 + 0.01), y1: H * 0.80 }], weight: 0.08 });
+      }
+      pushLine(W * 0.74, H * 0.48, W * 0.93, H * 0.52, H * 0.06, 14, 'h', 0.5);
+      pushLine(W * 0.76, H * 0.64, W * 0.92, H * 0.68, H * 0.05, 12, 'h', 0.4);
+      pushLine(W * 0.3, H * 0.81, W * 0.72, H * 0.81, H * 0.045, 22, 'h', 1.05);
+      let sum = 0;
+      for (let s = 0; s < segs.length; s++) sum += segs[s].weight;
+      const out = [];
+      let acc = 0;
+      for (let s = 0; s < segs.length; s++) {
+        const seg = segs[s];
+        const t0 = acc / sum;
+        acc += seg.weight;
+        const t1 = acc / sum;
+        const n = seg.pts.length;
+        for (let i = 0; i < n; i++) {
+          const p = seg.pts[i];
+          p.t = n === 1 ? t1 : (t0 + (t1 - t0) * (i / (n - 1)));
+          out.push(p);
+        }
+      }
+      return out;
+    };
+    const framePaint = (now) => {
+      if (phase !== 'paint' && phase !== 'lift') return;
+      if (!motion) return;
+      const u = motion.dur <= 0 ? 1 : Math.min(1, (now - motion.t0) / motion.dur);
+      if (brushPts) {
+        while (brushCursor < brushPts.length && brushPts[brushCursor].t <= u) {
+          stampBrush(brushPts[brushCursor]);
+          brushCursor++;
+        }
+      }
+      if (u >= 0.9) {
+        const seal = el.querySelector('.logo-seal');
+        if (seal) seal.classList.add('stamping');
+        mark('lift', Math.round(u * 100));
+        phase = 'lift';
+      } else mark('paint', Math.round(u * 100));
+      if (u >= 1) {
+        finishPaint();
+        timer = setTimeout(beginDrop, 650);
+        return;
+      }
+      raf = requestAnimationFrame(framePaint);
+    };
+    // 横竖屏共用原横板与笔迹，画布始终跟随题额比例。
+    const arrangeArt = () => {
+      plateImg = sourcePlate;
+      glyphImg = sourceGlyph;
+    };
+    const sizeBrush = () => {
+      const box = el.querySelector('.splash-board').getBoundingClientRect();
+      brushDpr = Math.min(2, window.devicePixelRatio || 1); brushW = box.width; brushH = box.height;
+      brush.width = Math.round(brushW * brushDpr); brush.height = Math.round(brushH * brushDpr);
+      brushCtx = brush.getContext('2d');
+      if (!brushCtx) return;
+      brushCtx.setTransform(brushDpr, 0, 0, brushDpr, 0, 0); arrangeArt(); brushPts = buildBrush();
+    };
+    const startPaint = () => {
+      if (phase === 'done') return;
+      if (!brush) { finish(true); return; }
+      sizeBrush();
+      if (!brushCtx) { finish(true); return; }
+      brushCursor = 0; motion = { t0: performance.now(), dur: T.paint };
+      raf = requestAnimationFrame(framePaint);
+    };
+    let inkReady = false;
+    Promise.all([
+      loadInk('img/open-plate.png?v=169'),
+      loadInk('img/open-glyph.png?v=169')
+    ]).then(pair => {
+      sourcePlate = plateImg = pair[0];
+      sourceGlyph = glyphImg = pair[1];
+      inkReady = true;
+      if ((phase === 'paint' || phase === 'lift') && el.classList.contains('skip')) finishPaint();
+    });
+    let armT0 = 0;
+    const armPaint = (now) => {
+      if (!armT0) armT0 = now || performance.now();
+      if (phase !== 'paint' && phase !== 'lift') return;
+      if (el.classList.contains('skip')) {
+        finishPaint();
+        if (phase !== 'fall' && phase !== 'wave' && phase !== 'settle' && phase !== 'menu' && phase !== 'done') {
+          clearTimeout(timer);
+          timer = setTimeout(beginDrop, 120);
+        }
+        return;
+      }
+      if (!inkReady && (performance.now() - armT0) < 5000) {
+        raf = requestAnimationFrame(armPaint);
+        return;
+      }
+      if (!inkReady || !sourcePlate || !sourceGlyph) { finish(true); return; }
+      startPaint();
+    };
+    if (soft || document.hidden) { finish(true); return; }
+    requestAnimationFrame(() => {
+      el.classList.add('write');
+      if (soft) el.classList.add('quick');
+      armPaint();
+    });
+  });
+}
+function mountSW() {
+  if (!('serviceWorker' in navigator)) return;
+  if (location.protocol === 'file:') return;
+  const had = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.register('./sw.js?v=169').then(reg => {
+    const ask = w => {
+      const bar = document.getElementById('sw-refresh'); if (bar) bar.hidden = false;
+      if (w && had) { try { w.postMessage({ type: 'SKIP_WAITING' }); } catch (e) {} }
+    };
+    const track = w => {
+      if (!w || w._mx) return;
+      w._mx = 1;
+      const poke = () => { if (w.state === 'installed' && navigator.serviceWorker.controller) ask(w); };
+      if (w.state === 'installed') poke();
+      w.addEventListener('statechange', poke);
+    };
+    track(reg.installing); track(reg.waiting);
+    reg.addEventListener('updatefound', () => track(reg.installing));
+  }).catch(() => {});
+  const btn = document.getElementById('sw-refresh-btn');
+  if (btn) btn.onclick = () => {
+    try { save(); } catch (e) {}
+    navigator.serviceWorker.getRegistration().then(reg => {
+      const w = reg && (reg.waiting || reg.installing);
+      if (w && navigator.serviceWorker.controller) {
+        try { sessionStorage.setItem('mx-refresh', '1'); } catch (e) {}
+        try { w.postMessage({ type: 'SKIP_WAITING' }); } catch (e2) { location.reload(); }
+      } else {
+        try { sessionStorage.removeItem('mx-refresh'); } catch (e3) {}
+        location.reload();
+      }
+    }).catch(() => location.reload());
+  };
+}
+mountSW();
+
+function retireIntro() {
+  const intro = document.getElementById('intro');
+  const sp = document.getElementById('splash');
+  if (intro) intro.hidden = true;
+  if (sp) sp.hidden = true;
+  const warm = () => {
+    document.querySelectorAll('#realm-scape img').forEach(img => { if (img.decode) img.decode().catch(() => {}); });
+  };
+  if (window.requestIdleCallback) requestIdleCallback(warm, { timeout: 1200 });
+  else setTimeout(warm, 400);
+}
+// 视觉素材与字体都就绪后再开卷，避免字体替换造成的半截状态
+Promise.all([
+  initVisuals(),
+  preloadSplash(),
+  Promise.race([document.fonts ? document.fonts.ready : Promise.resolve(), sleep(2500)]),
+]).catch(() => {}).then(() => splashWait()).then(() => {
+  applyLook();
+  // 原题额、墨滴与山河的连续演出结束，交还菜单。
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    if (!document.body.classList.contains('go')) document.body.classList.add('go');
+    document.body.classList.remove('hold');
+    if (typeof Wallpaper !== 'undefined' && Wallpaper.kick) Wallpaper.kick(1000);
+  }));
+  // 旧片头节点保持隐藏，预热仅在空闲时进行。
+  setTimeout(retireIntro, 600);
+});
+
+/* 日志与侧笺滚动时短暂显示墨条，停下后还给纸面。 */
+(() => {
+  document.querySelectorAll('#log, #scr-main .side, #scr-main .hud').forEach(panel => {
+    let tmr = 0;
+    panel.addEventListener('scroll', () => { panel.classList.add('is-scrolling'); clearTimeout(tmr); tmr = setTimeout(() => panel.classList.remove('is-scrolling'), 1400); }, { passive: true });
+  });
+})();
+
+window.__moxian = { get S() { return S; }, set S(v) { S = v; }, get busy() { return busy; }, set busy(v) { busy = v; }, save, render, pushLog, act, openBreak, openBag, openShop, openSexSheet, openCult, refreshOpenPanel, maybeFabaoCeremony, FabaoArt: typeof FabaoArt !== 'undefined' ? FabaoArt : null, showEnd, openEvent: id => openEvent(EVENTS.find(e => e.id === id)), Core, openSect, runRite, startDabi, dabiInvite, openMission: uid => openEvent(Core.missionEvent(S, uid)), openPathCeremony, ensurePendingPath, pathPage, openBaishan, openOrigin, runBreak, JHUI, BtFx: typeof BtFx !== 'undefined' ? BtFx : null, MoAudio: typeof MoAudio !== 'undefined' ? MoAudio : null, Samsara: typeof Samsara !== 'undefined' ? Samsara : null, openAtlasSheet, openNaihe, openSlots, saveScroll, closeScrollView, maybeGuide, newGame, Slots: typeof Slots !== 'undefined' ? Slots : null, Codec: typeof Codec !== 'undefined' ? Codec : null, ScrollArt: typeof ScrollArt !== 'undefined' ? ScrollArt : null, Life: typeof Life !== 'undefined' ? Life : null, Juan: typeof Juan !== 'undefined' ? Juan : null, InkPortrait: typeof InkPortrait !== 'undefined' ? InkPortrait : null, Loop: typeof Loop !== 'undefined' ? Loop : null, openGoalPicker, openAnnals, openLook, applyLook };
+
+function openVillageTasks() {
+  if (!S || !S.village) return;
+  const wrap = document.createElement('div'); wrap.className = 'village-tasks';
+  const draw = () => {
+    const v = S.village; wrap.innerHTML = '';
+    const p = document.createElement('p');
+    p.textContent = Village.talents[v.talent-1] + '：' + Village.effects[v.talent-1] + '\n普通材料 '+v.material+' · 药布 '+v.medicine+' · 筹备 '+v.coupons+' · '+(v.tools?'自有工具':'镇上可借工具')+'。器物入门 '+v.art.toFixed(2)+'/100。'+(v.goal?'首个普通目标已完成。':'先完成送米、交信或修补，安顿下来。')+(v.relic?'旧物：'+(v.awake?'已醒':'封存')+'；成功吐纳 '+v.breaths+'/10。':'')+(v.relic==='bead'&&v.awake?'储息 '+v.stored.toFixed(2)+' / '+(v.capacity||'下一次基础产出')+'。'+(v.release?'已约下次吐纳释放。':'储满后可手动约下次吐纳释放。'):'');
+    wrap.appendChild(p);
+    const counter={2:['injury','耐劳'],3:['craft','省料'],4:['clue','察微'],6:['gather','识采']}[v.talent];
+    const counts=document.createElement('p'); counts.textContent=(counter?counter[1]+'余次 '+Village.left(v,counter[0])+'。':'')+(v.relic==='booktag'?'铜签返料余次 '+Village.left(v,'booktag'):v.relic==='swordcore'?'铁芯维护余次 '+Village.left(v,'maintenance'):'')+(v.relic&&!v.awake?'（封存中，尚不生效）':'');wrap.appendChild(counts);
+    const rows = [['job','乡邻的普通差事：送米，一月，得二灵石'],['gather','山脚采集：一月，通常得一份普通材料，遇雨无出产'],['supply','补给：一灵石换一份普通材料'],['basic','免费研读基础功法：一月，四进度'],['basicPaid','临帖研读：一月、一份材料，五进度'],['art','读器物图谱：一月，四进度；学满可制基础工具'],['repair','镇上匠人修补委托：一月，二份材料，自有工具另用一份维护；借工具得三灵石，自有工具得五灵石'],['explore','探查山脚两条小路'],['heal','药布包扎：一份，伤势减一']];
+    if(v.route==='letter'&&!v.letterDone)rows.unshift(['letter','赴先生旧识之约：交信并送米，一月，得二灵石']);
+    if(v.relic&&!v.awake)rows.push(['awaken',v.relic==='booktag'?'请抄书人辨纹：学会基础功法后，一月，固定解封':v.relic==='swordcore'?'旧铁芯：完成修补委托便能嵌回工具':'祭炼小珠：十次成功吐纳、普通目标、一份材料，固定成功']);
+    if(v.relic==='bead'&&v.awake)rows.push(['release',v.release?'取消下次放息':'储满后，约下一次基础吐纳放息']);
+    if(v.coupons)rows.push(['coupon:money','筹备换一灵石'],['coupon:material','筹备换一份普通材料'],['coupon:medicine','筹备换一份药布']);
+    if(v.explore){const clue=document.createElement('p');clue.textContent=v.explore.text;wrap.appendChild(clue);rows.length=0;rows.push(['ridge','走高坡'],['bank','沿岸走'],['retreat','折返']);}
+    rows.forEach(row=>{const b=document.createElement('button');b.textContent=row[1];b.onclick=()=>{const out=Village.action(S,row[0],pushLog);if(out.err){toast(out.err);return;}pushLog({title:'村中旧事',text:out.text});save();render();if(S.dead||S.ascended){closeSheet();checkEnd();return;}draw();};wrap.appendChild(b);});
+  };draw();wrap._refresh=draw;openSheet('村中旧事',wrap);
+}
+})();
