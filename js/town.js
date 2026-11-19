@@ -5,6 +5,11 @@ const Town = (() => {
     { id:'li_zhiwei', name:'李知微', short:'李大夫', seal:'李', title:'李记药铺 · 坐堂大夫', sex:'f', wish:'药能救人，也要让药铺长久开下去', goal:'柜上赊账渐多，仍不忍拒了急病的人' },
     { id:'chen_laosan', name:'陈老三', short:'陈铁匠', seal:'陈', title:'铁匠铺 · 铁匠', sex:'m', wish:'打出的铁件要经得起年月', goal:'等着工钱结药账，炉里的火不敢停' }
   ];
+  const EXISTING = [
+    { id:'village_teacher', name:'周先生', short:'周先生', existing:true },
+    { id:'village_craftsman', name:'鲁师傅', short:'鲁师傅', existing:true },
+    { id:'village_mother', name:'母亲', short:'母亲', existing:true }
+  ];
   const LOCATIONS = [
     { id:'gate', name:'镇口', seal:'口', person:'', x:8, y:54, lx:7, ly:49, text:'青石路从这里进镇。商队、旅人和回村的人，都要在界石旁停一停脚。', action:'听听路上的消息', route:'M590 390 C440 430 230 430 84 302' },
     { id:'oldtree', name:'镇中老槐', seal:'槐', person:'', x:49, y:49, lx:47, ly:37, text:'老槐遮住半条街。树下说书人讲仙人的事，也讲镇上谁家的仓漏了、谁家的炉熄了。', action:'在老槐下坐坐', route:'M590 390 C575 355 565 310 564 207' },
@@ -39,7 +44,7 @@ const Town = (() => {
     return town;
   }
   function place(id){return LOCATIONS.find(p=>p.id===id);}
-  function person(id){return CONTACTS.find(c=>c.id===id);}
+  function person(id){return CONTACTS.concat(EXISTING).find(c=>c.id===id);}
   function note(s,id) {
     const stage=ensure(s).granary.stage;
     if(id==='grain')return['粮仓后檐还在滴水。王守仓把米袋往里挪，见你来了，才停下手。','仓木已经看过，接下来要请鲁师傅配好新木。','新木已上，门闩与铁件还得陈老三来看。','陈老三已经应下铁件，只差药钱与工钱有个着落。','粮仓已经修好，米袋重新码回干燥的架上。'][stage];
@@ -52,7 +57,13 @@ const Town = (() => {
   }
   function talk(s,id) {
     const c=person(id);if(!c)return{err:'这里没有要叙话的人'};
-    if(typeof Core.npcAlive==='function'&&!Core.npcAlive(s,id))return{err:'故人已经不在'};
+    if(s.npc&&s.npc[id]&&s.npc[id].dead)return{err:'故人已经不在'};
+    if(c.existing){
+      if(s.adult&&s.adult.started){const out=Adulthood.interact(s,id,'talk');if(!out.err)ensure(s).met[id]=true;return out;}
+      Core.passDays(s,1);if(s.npc&&s.npc[id])s.npc[id].met=true;ensure(s).met[id]=true;
+      const lines={village_teacher:'周先生问起你最近读过的书，也告诉你村塾里的孩子近来都很好。',village_craftsman:'鲁师傅让你摸一摸新刨平的木料，说做活先要把手里的尺寸认清楚。',village_mother:'母亲问你有没有吃饱，又把院里的衣服收好，叫你出门别忘了回家。'};
+      return{title:c.name,text:lines[id],tags:[]};
+    }
     Core.passDays(s,1);if(s.npc&&s.npc[id])s.npc[id].met=true;ensure(s).met[id]=true;
     const stage=s.town.qingshi.granary.stage,path=s.town.qingshi.granary.path;
     let text='';

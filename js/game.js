@@ -747,7 +747,7 @@ let xiantuGen = 0;
 let xiantuCurrent = null;
 let newLifeLock = false;
 window.__xiantuStats = { arrivals: 0, dismisses: 0, fails: 0, ignored: 0 };
-const XIANTU_URL = 'opening/xiantu.html?v=169';
+const XIANTU_URL = 'opening/xiantu.html?v=170';
 
 function xiantuValid(result) {
   if (!result || result.type !== 'xiantu-opening:complete' || result.version !== 1) return false;
@@ -2528,6 +2528,7 @@ function choose(ev, c, btn, evText, titleText) {
   const box = $('#ev-choices'); if (box.classList.contains('chosen')) return;
   btn.classList.add('picked'); box.classList.add('chosen');
   const res = Core.resolveChoice(S, c);
+  if (res && res.err) { box.classList.remove('chosen'); btn.classList.remove('picked'); toast(res.err); return; }
   const B = buffer(), fxR = Core.applyFx(S, res.fx || {}, B.emit);
   const tags = [...(res.tags || []), ...(fxR.tags || [])], ups = fxR.ups;
   if (res.fx && res.fx.gf) FX.goldMotes && setTimeout(() => { const t = $('#ev-result').getBoundingClientRect(); FX.goldMotes(t.left + t.width / 2, t.top + 20); }, 900);
@@ -4714,7 +4715,7 @@ const scrollShade = document.querySelector('#scroll-view .scroll-shade');
 if (scrollShade) scrollShade.onclick = () => closeScrollView();
 
 function preloadSplash() {
-  const urls = ['img/open-plate.png?v=169', 'img/open-glyph.png?v=169', 'img/open-seal-logo.png?v=169'];
+  const urls = ['img/open-plate.png?v=170', 'img/open-glyph.png?v=170', 'img/open-seal-logo.png?v=170'];
   const jobs = urls.map(u => new Promise(res => {
     const im = new Image();
     im.onload = im.onerror = () => res();
@@ -5314,8 +5315,8 @@ function splashWait() {
     };
     let inkReady = false;
     Promise.all([
-      loadInk('img/open-plate.png?v=169'),
-      loadInk('img/open-glyph.png?v=169')
+      loadInk('img/open-plate.png?v=170'),
+      loadInk('img/open-glyph.png?v=170')
     ]).then(pair => {
       sourcePlate = plateImg = pair[0];
       sourceGlyph = glyphImg = pair[1];
@@ -5353,7 +5354,7 @@ function mountSW() {
   if (!('serviceWorker' in navigator)) return;
   if (location.protocol === 'file:') return;
   const had = !!navigator.serviceWorker.controller;
-  navigator.serviceWorker.register('./sw.js?v=169').then(reg => {
+  navigator.serviceWorker.register('./sw.js?v=170').then(reg => {
     const ask = w => {
       const bar = document.getElementById('sw-refresh'); if (bar) bar.hidden = false;
       if (w && had) { try { w.postMessage({ type: 'SKIP_WAITING' }); } catch (e) {} }
