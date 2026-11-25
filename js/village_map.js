@@ -76,7 +76,12 @@ const VillageMap = (() => {
   function renderCard(map, s, onTravel, onPlace) {
     const card = map.querySelector('.map-card'); card.innerHTML = '';
     if (!selected) {
-      const p = document.createElement('p'); p.className = 'village-map-empty'; p.textContent = '点一处地名，看看今日能去哪里。村里的路不远，确认之后才会启程。'; card.appendChild(p); return;
+      const p = document.createElement('p'); p.className = 'village-map-empty'; p.textContent = '点一处地名，看看今日能去哪里。村里的路不远，确认之后才会启程。'; card.appendChild(p);
+      if(typeof Town!=='undefined'){
+        const memories=Town.recent(s);
+        if(memories.length){const recent=document.createElement('div');recent.className='town-recent';const title=document.createElement('strong');title.textContent='镇中近况';recent.appendChild(title);memories.forEach(memory=>{const line=document.createElement('p');line.textContent=memory.text;recent.appendChild(line);});card.appendChild(recent);}
+      }
+      return;
     }
     const head = document.createElement('div'); head.className = 'mc-head';
     const seal = document.createElement('span'); seal.className = 'mc-seal'; seal.textContent = selected.seal; head.appendChild(seal);
@@ -84,7 +89,7 @@ const VillageMap = (() => {
     const desc = document.createElement('p'); desc.className = 'mc-desc'; desc.textContent = selected.text; card.appendChild(desc);
     const gathering = !!selected.items, season = Math.floor((s.months % 12) / 3);
     const meta = document.createElement('div'); meta.className = 'mc-meta';
-    meta.textContent = gathering ? `当季可见 · ${selected.items[season]}　　路程 · 一日` : '镇中地点 · 人物与事情都在此处'; card.appendChild(meta);
+    meta.textContent = gathering ? `当季可见 · ${selected.items[season]}　　路程 · 一日` : selected.id==='grain'&&typeof Town!=='undefined'?`粮仓 · ${Town.status(s)}` : '镇中地点 · 人物与事情都在此处'; card.appendChild(meta);
     const go = document.createElement('button'); go.type = 'button'; go.className = 'village-map-go';
     const label = document.createElement('b'); label.textContent = selected.action; go.appendChild(label);
     const small = document.createElement('small'); small.textContent = gathering ? '一日 · 采集' : '进入地点'; go.appendChild(small); card.appendChild(go);
@@ -128,6 +133,7 @@ const VillageMap = (() => {
       tag.style.left = place.lx + '%'; tag.style.top = place.ly + '%'; tag.setAttribute('aria-label', place.name);
       const slip = document.createElement('span'); slip.className = 'tag-slip'; slip.appendChild(vtext(place.name)); tag.appendChild(slip);
       const seal = document.createElement('span'); seal.className = 'tag-seal'; seal.textContent = place.seal; tag.appendChild(seal);
+      if(place.id==='grain'&&typeof Town!=='undefined'){const state=document.createElement('small');state.className='map-tag-state';state.textContent=Town.status(s);tag.appendChild(state);}
       tag.onclick = () => {
         if (busy) return; selected = place;
         marks.querySelectorAll('.map-tag').forEach(el => el.classList.toggle('sel', el.dataset.id === place.id));

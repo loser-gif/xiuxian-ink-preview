@@ -39,6 +39,8 @@ const Town = (() => {
     town.granary=town.granary||{stage:0,path:''};
     if(typeof town.granary.stage!=='number')town.granary.stage=0;
     if(typeof town.granary.path!=='string')town.granary.path='';
+    if(typeof town.granary.updatedAt!=='number')town.granary.updatedAt=Calendar.absolute(s);
+    town.granary.memories=Array.isArray(town.granary.memories)?town.granary.memories:[];
     town.met=town.met||{};
     if(typeof People!=='undefined'){People.ensure(s);CONTACTS.forEach(c=>{if(s.npc[c.id].met==null)s.npc[c.id].met=false;});}
     return town;
@@ -47,6 +49,7 @@ const Town = (() => {
   function person(id){return CONTACTS.concat(EXISTING).find(c=>c.id===id);}
   function note(s,id) {
     const stage=ensure(s).granary.stage;
+    if(id==='grain'&&stage===4&&s.town.qingshi.granary.path==='selfRepair')return'粮仓已经补好，但一部分米粮受了潮。王守仓另找人仓促完工，没有把你记成帮忙的人。';
     if(id==='grain')return['粮仓后檐还在滴水。王守仓把米袋往里挪，见你来了，才停下手。','仓木已经看过，接下来要请鲁师傅配好新木。','新木已上，门闩与铁件还得陈老三来看。','陈老三已经应下铁件，只差药钱与工钱有个着落。','粮仓已经修好，米袋重新码回干燥的架上。'][stage];
     if(id==='medicine'&&stage===3)return'李知微翻着赊账册，没有催陈老三，只说治病与结账都得有个章程。';
     if(id==='medicine'&&stage===4)return'李知微把陈老三那一页赊账作了结，药铺仍照常有急病的人来。';
@@ -54,6 +57,24 @@ const Town = (() => {
     if(id==='forge'&&stage===4)return'铁匠铺重新开炉，修好的门闩已经送回王记。';
     if(id==='carpenter'&&stage>=2)return'鲁师傅已经配好仓木，剩下铁件要由铁匠铺接手。';
     return place(id)?place(id).text:'';
+  }
+  function status(s) {
+    const stage=ensure(s).granary.stage;
+    return stage===0?'漏雨':stage<4?'修缮中':'已修好';
+  }
+  function recent(s) { return ensure(s).granary.memories.slice(-3).reverse(); }
+  function remember(s,kind,text) {
+    const g=ensure(s).granary;g.memories.push({kind,at:Calendar.absolute(s),text});if(g.memories.length>8)g.memories.splice(0,g.memories.length-8);
+    const lines={debtPaid:[['li_zhiwei','陈老三的药钱已由你结清。'],['chen_laosan','陈老三已经开炉，修好的铁件送回王记。']],wageAdvanced:[['wang_shoucang','王守仓先结清工钱，陈老三已还药账。'],['chen_laosan','工钱已经结清，铁匠铺重新开炉。']],selfRepair:[['wang_shoucang','王守仓另找人仓促修仓，部分米粮受潮。'],['li_zhiwei','陈老三的药账拖了许久才慢慢结清。'],['chen_laosan','工钱拖了些时日才到，铁匠铺终于重新开炉。']]};
+    (lines[kind]||[]).forEach(([id,line])=>{if(typeof People!=='undefined')People.note(s,id,'在',line);});
+  }
+  function tick(s,at,emit) {
+    if(!s.adult||!s.adult.started)return;
+    const g=ensure(s).granary,now=typeof at==='number'?at:Calendar.absolute(s);
+    if(g.stage>=4||now-g.updatedAt<90)return;
+    const previous=g.stage;g.stage=4;g.path='selfRepair';g.updatedAt=now;
+    const text=previous===0?'你一直没有插手王记的事。王守仓另找人仓促修仓，一部分米粮受潮了。':'你中途离开以后，王守仓另找人把剩下的工序仓促做完，一部分米粮受潮了。';
+    remember(s,'selfRepair',text);if(emit)emit({title:'王记粮仓',text,cls:'sys'});
   }
   function talk(s,id) {
     const c=person(id);if(!c)return{err:'这里没有要叙话的人'};
@@ -83,10 +104,10 @@ const Town = (() => {
     };
     const d=defs[actionId];if(!d||d.place!==placeId||d.stage!==g.stage)return{err:'这件事眼下不在这里'};
     if(d.cost&&s.ls<d.cost)return{err:'灵石不够，先去别处想想办法'};
-    Core.passDays(s,d.days);if(d.cost)s.ls-=d.cost;g.stage=d.next;if(d.path)g.path=d.path;
+    Core.passDays(s,d.days);g.updatedAt=Calendar.absolute(s);if(d.cost)s.ls-=d.cost;g.stage=d.next;if(d.path)g.path=d.path;
     const personId=placeId==='grain'?'wang_shoucang':placeId==='medicine'?'li_zhiwei':placeId==='forge'?'chen_laosan':placeId==='carpenter'?'village_craftsman':'';
     if(personId&&s.npc&&s.npc[personId])s.npc[personId].met=true;
-    if(g.stage===4){s.items['干粮']=(s.items['干粮']||0)+3;}
+    if(g.stage===4){s.items['干粮']=(s.items['干粮']||0)+3;remember(s,d.path,'你参与修好了王记粮仓，药钱与工钱都有了结果。');}
     return{text:d.text+(g.stage===4?' 粮仓终于修好，王守仓另包了三份干粮谢你。':''),tags:g.stage===4?[{t:'粮仓已修好',c:'gold'},{t:'干粮 +3',c:'up'}]:[{t:'粮仓一事有了下文',c:'up'}]};
   }
   function eventFor(s,id) {
@@ -103,5 +124,5 @@ const Town = (() => {
       return list;
     }};
   }
-  return{ensure,places:LOCATIONS,contacts:CONTACTS,placeNote:note,eventFor,choose,talk};
+  return{ensure,places:LOCATIONS,contacts:CONTACTS,placeNote:note,eventFor,choose,talk,tick,status,recent};
 })();

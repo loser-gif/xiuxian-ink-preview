@@ -276,6 +276,7 @@ const Adulthood = (() => {
       if (s.npc && s.npc.village_craftsman) People.note(s, 'village_craftsman', '在', text);
       if (emit) emit({ title: '村塾修缮', text, cls: p.stage === 2 ? 'gold' : 'sys' });
     }
+    if(typeof Town!=='undefined')Town.tick(s,undefined,emit);
     a.promises.forEach(promise => {
       if (promise.done || promise.missed || absolute(s) <= promise.due + 15) return;
       promise.missed = true; Core.npcAdd(s, promise.id, -4);
