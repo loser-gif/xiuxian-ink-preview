@@ -384,3 +384,5 @@ node tools/serve.js
 手机检查为390×844设备尺寸模拟，因内置浏览器的模拟触控未触发页面按钮，实际操作使用键盘触发；镇图、屏外地点、近况与存档均可到达，仍不能代替真机触控测试。中途离开的手机截图为 `docs/reviews/replica-v144/43-granary-mid-v171.png`。
 
 规则回归、成年与完整凡人长局、事件与文案审计、全部 JavaScript 语法、字体审计及缓存一致性通过。200局 balanced 模拟的三灵根全体用时中位为82.4分钟。旧 Playwright 浏览器脚本因本机缺少其指定模块未运行，没有把依赖缺失算作玩法失败或通过。正式线上未修改。
+
+试用版已发布到 `https://loser-gif.github.io/xiuxian-ink-preview/`，提交 `2cf43d5363f8b3d5b2af5142158522bdb16e5c06`。无缓存请求确认 `index.html` 与 `sw.js` 均为 `moxian-v171`；实际打开试用站后看到“仓廪有声”公告，开卷可进入村塾名册。正式线上仍为 `moxian-v151`，未修改。
